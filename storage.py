@@ -9,7 +9,12 @@ import os
 import copy
 from threading import Lock
 
-_DATA_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data.json")
+# Каталог для данных. В Docker задаётся через ENV DATA_DIR=/app/data
+# (примонтируйте туда volume, чтобы настройки переживали перезапуск).
+# Если переменная не задана — пишем рядом с проектом, как раньше.
+_DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.dirname(__file__)))
+os.makedirs(_DATA_DIR, exist_ok=True)
+_DATA_FILE = os.path.join(_DATA_DIR, "data.json")
 _lock = Lock()
 
 # Настройки по умолчанию для каждого нового сервера
