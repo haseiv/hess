@@ -128,22 +128,28 @@ def update_guild(guild_id, **changes):
 #  ТИКЕТЫ: кнопки (persistent views)
 # ==========================================================================
 
-class TicketPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+class TicketModal(discord.ui.Modal, title="Создание тикета"):
+    """Форма, которая всплывает при нажатии кнопки создания тикета."""
 
-    @discord.ui.button(label="Создать тикет", style=discord.ButtonStyle.primary,
-                       emoji="🎫", custom_id="ticket:create")
-    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
+    тема = discord.ui.TextInput(
+        label="Тема обращения",
+        placeholder="Кратко: в чём вопрос?",
+        max_length=100, required=True)
+    описание = discord.ui.TextInput(
+        label="Подробное описание",
+        style=discord.TextStyle.paragraph,
+        placeholder="Что случилось? Когда? Что уже пробовали?",
+        max_length=1000, required=True)
+    приоритет = discord.ui.TextInput(
+        label="Приоритет (необязательно)",
+        placeholder="низкий / средний / высокий",
+        max_length=20, required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         cfg = get_guild(guild.id)
         tcfg = cfg["tickets"]
-
-        for ch_id, info in tcfg["open"].items():
-            if info.get("user") == interaction.user.id and guild.get_channel(int(ch_id)):
-                return await interaction.followup.send(
-                    f"У вас уже есть открытый тикет: <#{ch_id}>", ephemeral=True)
 
         category = guild.get_channel(tcfg["category"]) if tcfg["category"] else None
         overwrites = {
@@ -177,12 +183,44 @@ class TicketPanelView(discord.ui.View):
 
         mention = support_role.mention if support_role else ""
         embed = discord.Embed(
-            title=f"Тикет #{number:04d}",
-            description=f"{interaction.user.mention}, опишите вашу проблему — "
-                        f"поддержка скоро подключится.",
+            title=f"Тикет #{number:04d} — {self.тема.value}",
+            description=self.описание.value,
             color=discord.Color.blurple(), timestamp=discord.utils.utcnow())
+        embed.add_field(name="Автор", value=interaction.user.mention, inline=True)
+        if self.приоритет.value:
+            embed.add_field(name="Приоритет", value=self.приоритет.value, inline=True)
+        embed.set_footer(text="Поддержка скоро подключится")
         await channel.send(content=mention, embed=embed, view=TicketControlView())
         await interaction.followup.send(f"Ваш тикет создан: {channel.mention}", ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("Ошибка при создании тикета", exc_info=error)
+        msg = "Не удалось создать тикет. Сообщите администрации."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Создать тикет", style=discord.ButtonStyle.primary,
+                       emoji="🎫", custom_id="ticket:create")
+    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        cfg = get_guild(guild.id)
+        tcfg = cfg["tickets"]
+
+        # проверяем открытые тикеты ДО показа формы
+        for ch_id, info in tcfg["open"].items():
+            if info.get("user") == interaction.user.id and guild.get_channel(int(ch_id)):
+                return await interaction.response.send_message(
+                    f"У вас уже есть открытый тикет: <#{ch_id}>", ephemeral=True)
+
+        # показываем модальное окно (нельзя defer перед send_modal!)
+        await interaction.response.send_modal(TicketModal())
 
 
 class TicketControlView(discord.ui.View):
