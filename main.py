@@ -951,10 +951,248 @@ TOGGLES = {"антиспам": "antispam", "антиинвайт": "antiinvite",
            "антирейд": "antiraid", "антинюк": "antinuke",
            "усиленная защита": "strict_mode"}
 
+# читаемые названия для панели
+PROT_LABELS = {
+    "antispam": "Анти-спам", "antiinvite": "Анти-инвайт", "antiraid": "Анти-рейд",
+    "antinuke": "Анти-нюк", "strict_mode": "Усиленная защита",
+}
+
+
+# ==========================================================================
+#  БОЛЬШАЯ ПАНЕЛЬ УПРАВЛЕНИЯ  (/panel)
+# ==========================================================================
+
+class BackButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="◀ Назад", style=discord.ButtonStyle.secondary, row=4)
+
+    async def callback(self, interaction):
+        view = MainPanelView(interaction.guild.id)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+
+class CloseButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Закрыть", style=discord.ButtonStyle.danger, row=4)
+
+    async def callback(self, interaction):
+        await interaction.response.edit_message(
+            content="Панель закрыта.", embed=None, view=None)
+
+
+# ---------- Главное меню ----------
+
+class MainPanelView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+
+    def embed(self):
+        cfg = get_guild(self.guild_id)
+        p, t = cfg["protection"], cfg["tickets"]
+        yn = lambda v: "✅" if v else "❌"
+        prot = " ".join(f"{yn(p.get(k))}{PROT_LABELS[k]}" for k in PROT_LABELS)
+        types = ", ".join(x["label"] for x in t.get("types", [])) or "нет"
+        e = discord.Embed(
+            title="🎛️ Панель управления",
+            description="Выберите раздел кнопками ниже.",
+            color=discord.Color.blurple())
+        e.add_field(name="🛡️ Защита", value=prot, inline=False)
+        e.add_field(name="🎫 Тикеты",
+                    value=f"Типы: {types}\nОткрыто: {len(t.get('open', {}))}", inline=False)
+        log_ch = f"<#{cfg['log_channel']}>" if cfg["log_channel"] else "не задан"
+        tlog = f"<#{t['log_channel']}>" if t.get("log_channel") else "не задан"
+        e.add_field(name="⚙️ Логи", value=f"Защита: {log_ch}\nТикеты: {tlog}", inline=False)
+        return e
+
+    @discord.ui.button(label="🛡️ Защита", style=discord.ButtonStyle.primary)
+    async def protection(self, interaction, button):
+        view = ProtectionPanelView(self.guild_id)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="🎫 Тикеты", style=discord.ButtonStyle.primary)
+    async def tickets(self, interaction, button):
+        view = TicketsPanelView(self.guild_id)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="⚙️ Логи", style=discord.ButtonStyle.primary)
+    async def logs(self, interaction, button):
+        view = LogsPanelView(self.guild_id)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="Закрыть", style=discord.ButtonStyle.danger)
+    async def close(self, interaction, button):
+        await interaction.response.edit_message(content="Панель закрыта.", embed=None, view=None)
+
+
+# ---------- Раздел: Защита ----------
+
+class ProtToggleButton(discord.ui.Button):
+    def __init__(self, key, enabled):
+        super().__init__(
+            label=f"{PROT_LABELS[key]}: {'ВКЛ' if enabled else 'ВЫКЛ'}",
+            style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary)
+        self.key = key
+
+    async def callback(self, interaction):
+        cfg = get_guild(interaction.guild.id)
+        cfg["protection"][self.key] = not cfg["protection"].get(self.key)
+        save_guild(interaction.guild.id, cfg)
+        view = ProtectionPanelView(interaction.guild.id)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+
+class ProtectionPanelView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        p = get_guild(guild_id)["protection"]
+        for key in PROT_LABELS:
+            self.add_item(ProtToggleButton(key, p.get(key)))
+        self.add_item(BackButton())
+
+    def embed(self):
+        p = get_guild(self.guild_id)["protection"]
+        yn = lambda v: "✅ включена" if v else "❌ выключена"
+        lines = [f"**{PROT_LABELS[k]}** — {yn(p.get(k))}" for k in PROT_LABELS]
+        lines.append(f"\nБан по усиленной защите: за **{p.get('strict_threshold', 3)}** преда")
+        return discord.Embed(title="🛡️ Защита сервера",
+                             description="Нажимайте кнопки, чтобы включать/выключать.\n\n"
+                                         + "\n".join(lines),
+                             color=discord.Color.blurple())
+
+
+# ---------- Раздел: Логи ----------
+
+class LogSelect(discord.ui.ChannelSelect):
+    def __init__(self, target, placeholder):
+        super().__init__(channel_types=[discord.ChannelType.text],
+                         placeholder=placeholder, min_values=1, max_values=1)
+        self.target = target  # "protection" или "tickets"
+
+    async def callback(self, interaction):
+        ch = self.values[0]
+        cfg = get_guild(interaction.guild.id)
+        if self.target == "protection":
+            cfg["log_channel"] = ch.id
+        else:
+            cfg["tickets"]["log_channel"] = ch.id
+        save_guild(interaction.guild.id, cfg)
+        view = LogsPanelView(interaction.guild.id)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+
+class LogsPanelView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.add_item(LogSelect("protection", "Канал логов защиты"))
+        self.add_item(LogSelect("tickets", "Канал логов тикетов"))
+        self.add_item(BackButton())
+
+    def embed(self):
+        cfg = get_guild(self.guild_id)
+        log_ch = f"<#{cfg['log_channel']}>" if cfg["log_channel"] else "не задан"
+        tlog = f"<#{cfg['tickets']['log_channel']}>" if cfg["tickets"].get("log_channel") else "не задан"
+        return discord.Embed(
+            title="⚙️ Каналы логов",
+            description=f"**Логи защиты:** {log_ch}\n**Логи тикетов:** {tlog}\n\n"
+                        f"Выберите каналы в меню ниже.",
+            color=discord.Color.blurple())
+
+
+# ---------- Раздел: Тикеты ----------
+
+class PostMenuSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(channel_types=[discord.ChannelType.text],
+                         placeholder="Разместить меню тикетов в канале…",
+                         min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        cfg = get_guild(interaction.guild.id)
+        tcfg = cfg["tickets"]
+        types = tcfg.get("types", [])
+        if not types:
+            d = _default_type(cfg)
+            if d:
+                types = [d]; tcfg["types"] = types; save_guild(interaction.guild.id, cfg)
+            else:
+                return await interaction.response.send_message(
+                    "Сначала добавьте тип тикета в этом разделе.", ephemeral=True)
+        channel = interaction.guild.get_channel(self.values[0].id)
+        embed = discord.Embed(title=tcfg["panel_title"], description=tcfg["panel_description"],
+                              color=discord.Color.blurple())
+        try:
+            await channel.send(embed=embed, view=TicketSelectView(types))
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                f"Нет прав писать в {channel.mention}.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Меню тикетов размещено в {channel.mention}.", ephemeral=True)
+
+
+class RemoveTypeSelect(discord.ui.Select):
+    def __init__(self, types):
+        options = [discord.SelectOption(label=t["label"][:100], value=t["label"][:100])
+                   for t in types] or [discord.SelectOption(label="—", value="—")]
+        super().__init__(placeholder="Удалить тип…", min_values=1, max_values=1,
+                         options=options)
+
+    async def callback(self, interaction):
+        cfg = get_guild(interaction.guild.id)
+        types = cfg["tickets"].get("types", [])
+        cfg["tickets"]["types"] = [t for t in types if t["label"] != self.values[0]]
+        save_guild(interaction.guild.id, cfg)
+        view = TicketsPanelView(interaction.guild.id)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+
+class TicketsPanelView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.add_item(PostMenuSelect())
+        types = get_guild(guild_id)["tickets"].get("types", [])
+        if types:
+            self.add_item(RemoveTypeSelect(types))
+        self.add_item(BackButton())
+
+    def embed(self):
+        cfg = get_guild(self.guild_id)
+        t = cfg["tickets"]
+        types = t.get("types", [])
+        if types:
+            lines = []
+            for x in types:
+                cat = f"<#{x['category']}>" if x.get("category") else "—"
+                roles = ", ".join(f"<@&{r}>" for r in x.get("roles", [])) or "—"
+                q = x.get("questions")
+                qn = f"{len(q)} свои" if q else "стандартные"
+                lines.append(f"**{x['label']}** → {cat}, роли: {roles}, вопросы: {qn}")
+            desc = "\n".join(lines)
+        else:
+            desc = "Типов пока нет."
+        desc += ("\n\n**Добавление типов и вопросов** — командами "
+                 "`/ticket_type_add` и `/ticket_question_add` "
+                 "(там нужны выбор категории, ролей и текст).")
+        return discord.Embed(title="🎫 Тикеты", description=desc, color=discord.Color.blurple())
+
+
+def _panel_is_admin(interaction):
+    return interaction.user.guild_permissions.administrator
+
 
 class Config(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+    @app_commands.command(name="panel",
+                          description="Открыть общую панель управления ботом")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def panel(self, interaction):
+        view = MainPanelView(interaction.guild.id)
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="set_log", description="Задать канал логов защиты")
     @app_commands.checks.has_permissions(administrator=True)
