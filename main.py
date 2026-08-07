@@ -167,23 +167,37 @@ def _slug(text):
     return s or "тикет"
 
 
-class TicketModal(discord.ui.Modal, title="Создание тикета"):
-    """Форма создания тикета. Тип тикета передаётся в конструктор."""
+# Вопросы по умолчанию, если у типа не заданы свои
+DEFAULT_QUESTIONS = [
+    {"label": "Тема обращения", "style": "short", "required": True,
+     "placeholder": "Кратко: в чём вопрос?"},
+    {"label": "Подробное описание", "style": "paragraph", "required": True,
+     "placeholder": "Что случилось? Когда? Что уже пробовали?"},
+    {"label": "Приоритет (необязательно)", "style": "short", "required": False,
+     "placeholder": "низкий / средний / высокий"},
+]
 
-    тема = discord.ui.TextInput(
-        label="Тема обращения", placeholder="Кратко: в чём вопрос?",
-        max_length=100, required=True)
-    описание = discord.ui.TextInput(
-        label="Подробное описание", style=discord.TextStyle.paragraph,
-        placeholder="Что случилось? Когда? Что уже пробовали?",
-        max_length=1000, required=True)
-    приоритет = discord.ui.TextInput(
-        label="Приоритет (необязательно)", placeholder="низкий / средний / высокий",
-        max_length=20, required=False)
+
+class TicketModal(discord.ui.Modal):
+    """Форма создания тикета. Поля строятся динамически из вопросов типа
+    (или из DEFAULT_QUESTIONS, если у типа своих вопросов нет)."""
 
     def __init__(self, ticket_type):
-        super().__init__()
+        super().__init__(title=f"Тикет: {ticket_type.get('label', 'обращение')}"[:45])
         self.ticket_type = ticket_type
+        questions = ticket_type.get("questions") or DEFAULT_QUESTIONS
+        self._inputs = []  # [(label, TextInput)]
+        for q in questions[:5]:  # Discord: не более 5 полей
+            is_para = q.get("style") == "paragraph"
+            ti = discord.ui.TextInput(
+                label=q["label"][:45],
+                style=discord.TextStyle.paragraph if is_para else discord.TextStyle.short,
+                placeholder=(q.get("placeholder") or None),
+                required=q.get("required", True),
+                max_length=1000 if is_para else 300,
+            )
+            self.add_item(ti)
+            self._inputs.append((q["label"], ti))
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -227,15 +241,18 @@ class TicketModal(discord.ui.Modal, title="Создание тикета"):
             "roles": [r.id for r in roles], "type": t.get("label")}
         save_guild(guild.id, cfg)
 
+        # собираем ответы; первый вопрос идёт в заголовок, остальные — полями
+        answers = [(label, ti.value) for (label, ti) in self._inputs]
+        head = answers[0][1] if answers else ""
         mention = " ".join(r.mention for r in roles)
         embed = discord.Embed(
-            title=f"Тикет #{number:04d} — {self.тема.value}",
-            description=self.описание.value,
+            title=f"Тикет #{number:04d} — {head[:200]}" if head else f"Тикет #{number:04d}",
             color=discord.Color.blurple(), timestamp=discord.utils.utcnow())
         embed.add_field(name="Автор", value=interaction.user.mention, inline=True)
         embed.add_field(name="Тип", value=t.get("label", "—"), inline=True)
-        if self.приоритет.value:
-            embed.add_field(name="Приоритет", value=self.приоритет.value, inline=True)
+        for label, value in answers[1:]:
+            if value:
+                embed.add_field(name=label[:256], value=value[:1024], inline=False)
         embed.set_footer(text="Поддержка скоро подключится")
         await channel.send(content=mention or None, embed=embed, view=TicketControlView())
         await interaction.followup.send(f"Ваш тикет создан: {channel.mention}", ephemeral=True)
@@ -797,6 +814,94 @@ class Tickets(commands.Cog):
             lines.append(f"{emoji}**{t['label']}** → категория {cat}, роли: {roles}")
         embed = discord.Embed(title="🎫 Типы тикетов", description="\n".join(lines),
                               color=discord.Color.blurple())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ---------- Вопросы формы у каждого типа ----------
+
+    @app_commands.command(name="ticket_question_add",
+                          description="Добавить вопрос в форму типа тикета (до 5)")
+    @app_commands.describe(
+        type="Название типа тикета", label="Текст вопроса (до 45 символов)",
+        style="Тип поля: короткое или многострочное",
+        required="Обязательное ли поле", placeholder="Подсказка внутри поля (необязательно)")
+    @app_commands.choices(style=[
+        app_commands.Choice(name="короткое", value="short"),
+        app_commands.Choice(name="многострочное", value="paragraph"),
+    ])
+    @app_commands.checks.has_permissions(administrator=True)
+    async def ticket_question_add(self, interaction, type: str, label: str,
+                                  style: app_commands.Choice[str] = None,
+                                  required: bool = True, placeholder: str = None):
+        cfg = get_guild(interaction.guild.id)
+        t = next((x for x in cfg["tickets"].get("types", []) if x["label"] == type), None)
+        if t is None:
+            return await interaction.response.send_message(
+                f"Тип **{type}** не найден. Список: `/ticket_types`.", ephemeral=True)
+        questions = t.setdefault("questions", [])
+        if len(questions) >= 5:
+            return await interaction.response.send_message(
+                "У типа уже 5 вопросов — это максимум для формы Discord. "
+                "Удалите лишний через `/ticket_question_remove`.", ephemeral=True)
+        questions.append({
+            "label": label[:45],
+            "style": (style.value if style else "short"),
+            "required": required,
+            "placeholder": (placeholder or None),
+        })
+        save_guild(interaction.guild.id, cfg)
+        await interaction.response.send_message(
+            f"✅ Вопрос добавлен в тип **{type}** (всего {len(questions)}/5). "
+            f"Меню пересоздавать не нужно — форма обновится сразу.", ephemeral=True)
+
+    @app_commands.command(name="ticket_question_remove",
+                          description="Удалить вопрос из формы типа по номеру")
+    @app_commands.describe(type="Название типа", number="Номер вопроса из /ticket_questions")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def ticket_question_remove(self, interaction, type: str, number: int):
+        cfg = get_guild(interaction.guild.id)
+        t = next((x for x in cfg["tickets"].get("types", []) if x["label"] == type), None)
+        if t is None:
+            return await interaction.response.send_message(
+                f"Тип **{type}** не найден.", ephemeral=True)
+        questions = t.get("questions", [])
+        if not questions:
+            return await interaction.response.send_message(
+                "У этого типа сейчас стандартные вопросы (свои не заданы). "
+                "Добавьте свои через `/ticket_question_add`.", ephemeral=True)
+        if number < 1 or number > len(questions):
+            return await interaction.response.send_message(
+                f"Нет вопроса с номером {number}. Всего вопросов: {len(questions)}.",
+                ephemeral=True)
+        removed = questions.pop(number - 1)
+        if not questions:
+            t.pop("questions", None)  # вернётся к стандартным вопросам
+        save_guild(interaction.guild.id, cfg)
+        await interaction.response.send_message(
+            f"✅ Вопрос «{removed['label']}» удалён из типа **{type}**.", ephemeral=True)
+
+    @app_commands.command(name="ticket_questions",
+                          description="Показать вопросы формы у типа тикета")
+    @app_commands.describe(type="Название типа")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def ticket_questions(self, interaction, type: str):
+        cfg = get_guild(interaction.guild.id)
+        t = next((x for x in cfg["tickets"].get("types", []) if x["label"] == type), None)
+        if t is None:
+            return await interaction.response.send_message(
+                f"Тип **{type}** не найден.", ephemeral=True)
+        questions = t.get("questions")
+        default = questions is None
+        questions = questions or DEFAULT_QUESTIONS
+        style_ru = {"short": "короткое", "paragraph": "многострочное"}
+        lines = []
+        for i, q in enumerate(questions, 1):
+            req = "обязательное" if q.get("required", True) else "необязательное"
+            lines.append(f"**{i}.** {q['label']} — {style_ru.get(q.get('style'), 'короткое')}, {req}")
+        note = "\n\n_Сейчас используются стандартные вопросы. Добавьте свой через "\
+               "`/ticket_question_add`, и они заменят стандартные._" if default else ""
+        embed = discord.Embed(
+            title=f"Вопросы формы: {type}", description="\n".join(lines) + note,
+            color=discord.Color.blurple())
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="ticket_panel",
