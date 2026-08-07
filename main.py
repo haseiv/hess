@@ -1361,8 +1361,20 @@ class GuardBot(commands.Bot):
         await self.add_cog(Protection(self))
         await self.add_cog(Tickets(self))
         await self.add_cog(Config(self))
-        synced = await self.tree.sync()
-        log.info("Синхронизировано слэш-команд: %d", len(synced))
+
+        # Мгновенная синхронизация на конкретный сервер, если задан GUILD_ID.
+        # Глобальная синхронизация Discord обновляет команды у клиентов до часа,
+        # а синхронизация на сервер — за секунды. Для одного сервера удобнее GUILD_ID.
+        guild_id = os.getenv("GUILD_ID")
+        if guild_id and guild_id.isdigit():
+            guild = discord.Object(id=int(guild_id))
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            log.info("Синхронизировано команд на сервер %s: %d", guild_id, len(synced))
+        else:
+            synced = await self.tree.sync()
+            log.info("Синхронизировано глобальных команд: %d "
+                     "(появятся у клиентов в течение ~часа)", len(synced))
 
     async def on_ready(self):
         log.info("Бот запущен как %s (id: %s)", self.user, self.user.id)
