@@ -78,6 +78,7 @@ _DEFAULT_GUILD = {
                              "Команда поддержки ответит вам как можно скорее.",
         "counter": 0,
         "open": {},
+        "types": [],   # [{"label","category","roles":[...],"emoji","description"}]
     },
 }
 
@@ -148,30 +149,53 @@ def parse_color(value):
 #  ТИКЕТЫ: кнопки (persistent views)
 # ==========================================================================
 
+def _default_type(cfg):
+    """Тип по умолчанию: первый из настроенных, иначе из старых одиночных
+    настроек (category + support_role) для обратной совместимости."""
+    tcfg = cfg["tickets"]
+    types = tcfg.get("types", [])
+    if types:
+        return types[0]
+    if tcfg.get("category") and tcfg.get("support_role"):
+        return {"label": "Поддержка", "category": tcfg["category"],
+                "roles": [tcfg["support_role"]], "emoji": None, "description": None}
+    return None
+
+
+def _slug(text):
+    s = re.sub(r"[^\w-]+", "-", text.lower(), flags=re.UNICODE).strip("-")
+    return s or "тикет"
+
+
 class TicketModal(discord.ui.Modal, title="Создание тикета"):
-    """Форма, которая всплывает при нажатии кнопки создания тикета."""
+    """Форма создания тикета. Тип тикета передаётся в конструктор."""
 
     тема = discord.ui.TextInput(
-        label="Тема обращения",
-        placeholder="Кратко: в чём вопрос?",
+        label="Тема обращения", placeholder="Кратко: в чём вопрос?",
         max_length=100, required=True)
     описание = discord.ui.TextInput(
-        label="Подробное описание",
-        style=discord.TextStyle.paragraph,
+        label="Подробное описание", style=discord.TextStyle.paragraph,
         placeholder="Что случилось? Когда? Что уже пробовали?",
         max_length=1000, required=True)
     приоритет = discord.ui.TextInput(
-        label="Приоритет (необязательно)",
-        placeholder="низкий / средний / высокий",
+        label="Приоритет (необязательно)", placeholder="низкий / средний / высокий",
         max_length=20, required=False)
+
+    def __init__(self, ticket_type):
+        super().__init__()
+        self.ticket_type = ticket_type
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         cfg = get_guild(guild.id)
         tcfg = cfg["tickets"]
+        t = self.ticket_type
 
-        category = guild.get_channel(tcfg["category"]) if tcfg["category"] else None
+        category = guild.get_channel(t.get("category")) if t.get("category") else None
+        roles = [guild.get_role(r) for r in t.get("roles", [])]
+        roles = [r for r in roles if r]
+
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.user: discord.PermissionOverwrite(
@@ -181,16 +205,16 @@ class TicketModal(discord.ui.Modal, title="Создание тикета"):
                 view_channel=True, send_messages=True, manage_channels=True,
                 read_message_history=True),
         }
-        support_role = guild.get_role(tcfg["support_role"]) if tcfg["support_role"] else None
-        if support_role:
-            overwrites[support_role] = discord.PermissionOverwrite(
+        for r in roles:
+            overwrites[r] = discord.PermissionOverwrite(
                 view_channel=True, send_messages=True, read_message_history=True)
 
         tcfg["counter"] += 1
         number = tcfg["counter"]
+        prefix = _slug(t.get("label", "тикет"))[:20]
         try:
             channel = await guild.create_text_channel(
-                name=f"тикет-{number:04d}", category=category, overwrites=overwrites,
+                name=f"{prefix}-{number:04d}", category=category, overwrites=overwrites,
                 topic=f"Тикет пользователя {interaction.user} ({interaction.user.id})",
                 reason=f"Открыт тикет пользователем {interaction.user}")
         except discord.Forbidden:
@@ -198,19 +222,22 @@ class TicketModal(discord.ui.Modal, title="Создание тикета"):
                 "Не удалось создать канал. Проверьте права бота (Управление каналами).",
                 ephemeral=True)
 
-        tcfg["open"][str(channel.id)] = {"user": interaction.user.id, "claimed_by": None}
+        tcfg["open"][str(channel.id)] = {
+            "user": interaction.user.id, "claimed_by": None,
+            "roles": [r.id for r in roles], "type": t.get("label")}
         save_guild(guild.id, cfg)
 
-        mention = support_role.mention if support_role else ""
+        mention = " ".join(r.mention for r in roles)
         embed = discord.Embed(
             title=f"Тикет #{number:04d} — {self.тема.value}",
             description=self.описание.value,
             color=discord.Color.blurple(), timestamp=discord.utils.utcnow())
         embed.add_field(name="Автор", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Тип", value=t.get("label", "—"), inline=True)
         if self.приоритет.value:
             embed.add_field(name="Приоритет", value=self.приоритет.value, inline=True)
         embed.set_footer(text="Поддержка скоро подключится")
-        await channel.send(content=mention, embed=embed, view=TicketControlView())
+        await channel.send(content=mention or None, embed=embed, view=TicketControlView())
         await interaction.followup.send(f"Ваш тикет создан: {channel.mention}", ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
@@ -222,42 +249,94 @@ class TicketModal(discord.ui.Modal, title="Создание тикета"):
             await interaction.response.send_message(msg, ephemeral=True)
 
 
+def _has_open_ticket(guild, cfg, user_id):
+    for ch_id, info in cfg["tickets"]["open"].items():
+        if info.get("user") == user_id and guild.get_channel(int(ch_id)):
+            return ch_id
+    return None
+
+
+class TicketSelect(discord.ui.Select):
+    """Селект под эмбедом: выбор типа тикета. value каждой опции = label типа,
+    поэтому меню не хранит состояние и переживает перезапуск бота."""
+
+    def __init__(self, types):
+        options = [
+            discord.SelectOption(
+                label=t["label"][:100], value=t["label"][:100],
+                description=(t.get("description") or None),
+                emoji=(t.get("emoji") or None))
+            for t in (types or [])
+        ] or [discord.SelectOption(label="Нет доступных типов", value="—")]
+        super().__init__(custom_id="ticket:select",
+                         placeholder="Выберите тип обращения",
+                         min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        cfg = get_guild(interaction.guild.id)
+        types = cfg["tickets"].get("types", [])
+        chosen = self.values[0]
+        t = next((x for x in types if x["label"] == chosen), None)
+        if t is None:
+            return await interaction.response.send_message(
+                "Этот тип тикета больше недоступен. Обратитесь к администрации.",
+                ephemeral=True)
+        existing = _has_open_ticket(interaction.guild, cfg, interaction.user.id)
+        if existing:
+            return await interaction.response.send_message(
+                f"У вас уже есть открытый тикет: <#{existing}>", ephemeral=True)
+        await interaction.response.send_modal(TicketModal(t))
+
+
+class TicketSelectView(discord.ui.View):
+    def __init__(self, types=None):
+        super().__init__(timeout=None)
+        self.add_item(TicketSelect(types))
+
+
 class TicketPanelView(discord.ui.View):
+    """Старая панель с кнопкой — оставлена для совместимости с уже
+    размещёнными панелями. Использует тип по умолчанию."""
+
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Создать тикет", style=discord.ButtonStyle.primary,
                        emoji="🎫", custom_id="ticket:create")
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        cfg = get_guild(guild.id)
-        tcfg = cfg["tickets"]
-
-        # проверяем открытые тикеты ДО показа формы
-        for ch_id, info in tcfg["open"].items():
-            if info.get("user") == interaction.user.id and guild.get_channel(int(ch_id)):
-                return await interaction.response.send_message(
-                    f"У вас уже есть открытый тикет: <#{ch_id}>", ephemeral=True)
-
-        # показываем модальное окно (нельзя defer перед send_modal!)
-        await interaction.response.send_modal(TicketModal())
+        cfg = get_guild(interaction.guild.id)
+        existing = _has_open_ticket(interaction.guild, cfg, interaction.user.id)
+        if existing:
+            return await interaction.response.send_message(
+                f"У вас уже есть открытый тикет: <#{existing}>", ephemeral=True)
+        t = _default_type(cfg)
+        if t is None:
+            return await interaction.response.send_message(
+                "Тикеты ещё не настроены. Обратитесь к администрации.", ephemeral=True)
+        await interaction.response.send_modal(TicketModal(t))
 
 
 class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    def _is_support(self, member, cfg):
-        role_id = cfg["tickets"]["support_role"]
+    def _is_support(self, member, cfg, channel_id=None):
         if member.guild_permissions.administrator:
             return True
-        return role_id and any(r.id == role_id for r in member.roles)
+        role_ids = set()
+        rec = cfg["tickets"]["open"].get(str(channel_id)) if channel_id else None
+        if rec:
+            role_ids |= set(rec.get("roles", []))
+        # запасной вариант — старая одиночная роль поддержки
+        if cfg["tickets"].get("support_role"):
+            role_ids.add(cfg["tickets"]["support_role"])
+        return any(r.id in role_ids for r in member.roles)
 
     @discord.ui.button(label="Принять", style=discord.ButtonStyle.success,
                        emoji="✅", custom_id="ticket:claim")
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
         cfg = get_guild(interaction.guild.id)
-        if not self._is_support(interaction.user, cfg):
+        if not self._is_support(interaction.user, cfg, interaction.channel.id):
             return await interaction.response.send_message(
                 "Только поддержка может принимать тикеты.", ephemeral=True)
         info = cfg["tickets"]["open"].get(str(interaction.channel.id))
@@ -629,42 +708,134 @@ class Tickets(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="ticket_setup", description="Настроить систему тикетов")
-    @app_commands.describe(category="Категория для тикетов", support_role="Роль поддержки",
-                           log_channel="Канал логов тикетов")
+    @app_commands.command(name="ticket_setup",
+                          description="Задать канал логов тикетов (и запасной тип по умолчанию)")
+    @app_commands.describe(log_channel="Канал для истории закрытых тикетов",
+                           category="Категория по умолчанию (необязательно)",
+                           support_role="Роль поддержки по умолчанию (необязательно)")
     @app_commands.checks.has_permissions(administrator=True)
-    async def ticket_setup(self, interaction, category: discord.CategoryChannel,
-                           support_role: discord.Role, log_channel: discord.TextChannel):
+    async def ticket_setup(self, interaction, log_channel: discord.TextChannel,
+                           category: discord.CategoryChannel = None,
+                           support_role: discord.Role = None):
         cfg = get_guild(interaction.guild.id)
-        cfg["tickets"].update(category=category.id, support_role=support_role.id,
-                              log_channel=log_channel.id)
+        cfg["tickets"]["log_channel"] = log_channel.id
+        if category:
+            cfg["tickets"]["category"] = category.id
+        if support_role:
+            cfg["tickets"]["support_role"] = support_role.id
         save_guild(interaction.guild.id, cfg)
         await interaction.response.send_message(
-            f"✅ Тикеты настроены.\n• Категория: **{category.name}**\n"
-            f"• Роль: {support_role.mention}\n• Логи: {log_channel.mention}\n\n"
-            f"Теперь разместите панель командой `/ticket_panel`.", ephemeral=True)
+            f"✅ Логи тикетов: {log_channel.mention}\n\n"
+            f"Дальше добавьте типы тикетов командой `/ticket_type_add` "
+            f"(у каждого своя категория и роли), затем разместите меню `/ticket_panel`.",
+            ephemeral=True)
 
-    @app_commands.command(name="ticket_panel", description="Разместить панель с кнопкой")
-    @app_commands.describe(channel="Канал для панели", title="Заголовок (необязательно)",
-                           description="Текст (необязательно)")
+    @app_commands.command(name="ticket_type_add",
+                          description="Добавить тип тикета (своя категория + до 3 ролей поддержки)")
+    @app_commands.describe(
+        name="Название типа (видно в меню)", category="Категория, куда падают эти тикеты",
+        support_role1="Роль поддержки 1", support_role2="Роль поддержки 2",
+        support_role3="Роль поддержки 3", emoji="Эмодзи (необязательно)",
+        description="Короткое описание в меню (необязательно)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def ticket_type_add(self, interaction, name: str,
+                              category: discord.CategoryChannel,
+                              support_role1: discord.Role,
+                              support_role2: discord.Role = None,
+                              support_role3: discord.Role = None,
+                              emoji: str = None, description: str = None):
+        cfg = get_guild(interaction.guild.id)
+        types = cfg["tickets"].setdefault("types", [])
+        label = name[:100]
+        roles = [r.id for r in (support_role1, support_role2, support_role3) if r]
+        entry = {"label": label, "category": category.id, "roles": roles,
+                 "emoji": (emoji or None), "description": (description or None)}
+        existed = any(t["label"] == label for t in types)
+        types[:] = [t for t in types if t["label"] != label]
+        if len(types) >= 25:
+            return await interaction.response.send_message(
+                "Достигнут предел в 25 типов (ограничение Discord).", ephemeral=True)
+        types.append(entry)
+        save_guild(interaction.guild.id, cfg)
+        role_mentions = ", ".join(f"<@&{r}>" for r in roles)
+        action = "обновлён" if existed else "добавлен"
+        await interaction.response.send_message(
+            f"✅ Тип **{label}** {action}.\n• Категория: **{category.name}**\n"
+            f"• Роли: {role_mentions}\n\n"
+            f"Не забудьте пересоздать меню `/ticket_panel`, чтобы новый тип появился.",
+            ephemeral=True)
+
+    @app_commands.command(name="ticket_type_remove", description="Удалить тип тикета")
+    @app_commands.describe(name="Название типа")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def ticket_type_remove(self, interaction, name: str):
+        cfg = get_guild(interaction.guild.id)
+        types = cfg["tickets"].get("types", [])
+        before = len(types)
+        types[:] = [t for t in types if t["label"] != name]
+        save_guild(interaction.guild.id, cfg)
+        if len(types) < before:
+            await interaction.response.send_message(
+                f"✅ Тип **{name}** удалён. Пересоздайте меню `/ticket_panel`.", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                f"Тип **{name}** не найден.", ephemeral=True)
+
+    @app_commands.command(name="ticket_types", description="Список типов тикетов")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def ticket_types(self, interaction):
+        cfg = get_guild(interaction.guild.id)
+        types = cfg["tickets"].get("types", [])
+        if not types:
+            return await interaction.response.send_message(
+                "Типы ещё не добавлены. Используйте `/ticket_type_add`.", ephemeral=True)
+        lines = []
+        for t in types:
+            cat = f"<#{t['category']}>" if t.get("category") else "—"
+            roles = ", ".join(f"<@&{r}>" for r in t.get("roles", [])) or "—"
+            emoji = (t.get("emoji") + " ") if t.get("emoji") else ""
+            lines.append(f"{emoji}**{t['label']}** → категория {cat}, роли: {roles}")
+        embed = discord.Embed(title="🎫 Типы тикетов", description="\n".join(lines),
+                              color=discord.Color.blurple())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="ticket_panel",
+                          description="Разместить эмбед с селект-меню выбора типа тикета")
+    @app_commands.describe(channel="Канал для меню", title="Заголовок (необязательно)",
+                           description="Текст (необязательно)", color="Цвет HEX (необязательно)")
     @app_commands.checks.has_permissions(administrator=True)
     async def ticket_panel(self, interaction, channel: discord.TextChannel,
-                           title: str = None, description: str = None):
+                           title: str = None, description: str = None, color: str = None):
         cfg = get_guild(interaction.guild.id)
         tcfg = cfg["tickets"]
-        if not tcfg["category"] or not tcfg["support_role"]:
-            return await interaction.response.send_message(
-                "Сначала настройте тикеты командой `/ticket_setup`.", ephemeral=True)
+        types = tcfg.get("types", [])
+        if not types:
+            # миграция старых одиночных настроек в один тип
+            d = _default_type(cfg)
+            if d:
+                types = [d]
+                tcfg["types"] = types
+                save_guild(interaction.guild.id, cfg)
+            else:
+                return await interaction.response.send_message(
+                    "Сначала добавьте хотя бы один тип: `/ticket_type_add`.", ephemeral=True)
         if title:
             tcfg["panel_title"] = title
         if description:
             tcfg["panel_description"] = description
         save_guild(interaction.guild.id, cfg)
+
         embed = discord.Embed(title=tcfg["panel_title"], description=tcfg["panel_description"],
-                              color=discord.Color.blurple())
-        await channel.send(embed=embed, view=TicketPanelView())
-        await interaction.response.send_message(f"✅ Панель размещена в {channel.mention}.",
-                                                ephemeral=True)
+                              color=parse_color(color))
+        view = TicketSelectView(types)
+        try:
+            await channel.send(embed=embed, view=view)
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                f"Нет прав писать в {channel.mention}.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Меню тикетов ({len(types)} тип(ов)) размещено в {channel.mention}.",
+            ephemeral=True)
 
 
 # ==========================================================================
@@ -741,9 +912,12 @@ class Config(commands.Cog):
         cat = f"<#{t['category']}>" if t["category"] else "не задана"
         role = f"<@&{t['support_role']}>" if t["support_role"] else "не задана"
         tlog = f"<#{t['log_channel']}>" if t["log_channel"] else "не задан"
+        types = t.get("types", [])
+        types_line = (", ".join(x["label"] for x in types)) if types else "нет (добавьте /ticket_type_add)"
         embed.add_field(name="🎫 Тикеты", value=(
-            f"Категория: {cat}\nРоль поддержки: {role}\nЛоги: {tlog}\n"
-            f"Открыто сейчас: {len(t['open'])}"), inline=False)
+            f"Логи: {tlog}\nТипы: {types_line}\n"
+            f"Открыто сейчас: {len(t['open'])}\n"
+            f"По умолчанию (старое): категория {cat}, роль {role}"), inline=False)
         warns = cfg.get("warnings", {})
         active = {u: c for u, c in warns.items() if c > 0}
         if active:
@@ -827,6 +1001,7 @@ class GuardBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(TicketPanelView())
         self.add_view(TicketControlView())
+        self.add_view(TicketSelectView())
 
         # восстанавливаем меню ролей, чтобы селекты работали после перезапуска
         restored = 0
