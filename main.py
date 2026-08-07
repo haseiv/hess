@@ -63,8 +63,12 @@ _DEFAULT_GUILD = {
         "antinuke": True,
         "antinuke_limit": 3,
         "antinuke_interval": 12,
+        "strict_mode": False,       # усиленная защита (преды + автобан)
+        "strict_threshold": 3,      # сколько предупреждений до бана
         "whitelist": [],
     },
+    "warnings": {},                 # {user_id: количество предупреждений}
+    "menus": {},                    # {message_id: {"channel": id, "options": [...]}}
     "tickets": {
         "category": None,
         "support_role": None,
@@ -122,6 +126,22 @@ def update_guild(guild_id, **changes):
     settings.update(changes)
     save_guild(guild_id, settings)
     return settings
+
+
+def load_all():
+    """Все серверы как есть (без подстановки значений по умолчанию)."""
+    with _lock:
+        return _load()
+
+
+def parse_color(value):
+    """Разобрать цвет из строки вида '#5865F2' или '5865F2'."""
+    if not value:
+        return discord.Color.blurple()
+    try:
+        return discord.Color(int(value.strip().lstrip("#"), 16))
+    except (ValueError, AttributeError):
+        return discord.Color.blurple()
 
 
 # ==========================================================================
@@ -294,6 +314,66 @@ class TicketControlView(discord.ui.View):
 
 
 # ==========================================================================
+#  КАСТОМНЫЙ ЭМБЕД С СЕЛЕКТОМ (меню выбора ролей)
+# ==========================================================================
+
+class RoleSelect(discord.ui.Select):
+    """Выпадающий список ролей. Значение каждой опции = id роли,
+    поэтому меню работает без внешнего хранилища состояния и переживает
+    перезапуск (привязка к сообщению по message_id при регистрации)."""
+
+    def __init__(self, options):
+        opts = [
+            discord.SelectOption(label=o["label"][:100], value=str(o["id"]),
+                                 description=o.get("description"))
+            for o in options
+        ] or [discord.SelectOption(label="—", value="0")]
+        super().__init__(
+            custom_id="rolemenu:select",
+            placeholder="Выберите роли, чтобы получить или снять их",
+            min_values=0, max_values=len(opts), options=opts,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        member = interaction.user
+        added, removed, failed = [], [], []
+        # переключаем ТОЛЬКО выбранные роли (безопасно: не трогаем остальные)
+        for value in self.values:
+            if value == "0":
+                continue
+            role = interaction.guild.get_role(int(value))
+            if role is None:
+                continue
+            try:
+                if role in member.roles:
+                    await member.remove_roles(role, reason="Меню ролей")
+                    removed.append(role.name)
+                else:
+                    await member.add_roles(role, reason="Меню ролей")
+                    added.append(role.name)
+            except discord.Forbidden:
+                failed.append(role.name)
+
+        parts = []
+        if added:
+            parts.append("✅ Выданы: " + ", ".join(added))
+        if removed:
+            parts.append("➖ Сняты: " + ", ".join(removed))
+        if failed:
+            parts.append("⚠️ Не хватило прав для: " + ", ".join(failed)
+                         + " (поднимите роль бота выше этих ролей)")
+        await interaction.followup.send("\n".join(parts) or "Изменений нет.", ephemeral=True)
+
+
+def build_rolemenu_view(options):
+    """Собрать View с меню ролей из списка опций [{'id':int,'label':str}]."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(RoleSelect(options))
+    return view
+
+
+# ==========================================================================
 #  COG: ЗАЩИТА
 # ==========================================================================
 
@@ -437,20 +517,108 @@ class Protection(commands.Cog):
             acts.clear()
             await self._punish_nuker(guild, actor, f"Массовое действие: {kind}")
 
+    # ---------- Усиленная защита: предупреждения + автобан ----------
+
+    async def _find_actor_kick(self, guild, target_id):
+        """Отличить кик от обычного выхода: ищем свежую запись kick в аудите."""
+        try:
+            async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.kick):
+                if entry.target and entry.target.id == target_id:
+                    # запись должна быть свежей (последние ~10 секунд)
+                    age = (discord.utils.utcnow() - entry.created_at).total_seconds()
+                    if age <= 10:
+                        return entry.user
+                    return None
+        except (discord.Forbidden, discord.HTTPException):
+            return None
+        return None
+
+    async def _strict_warn(self, guild, actor, reason):
+        """Выдать предупреждение нарушителю; при достижении порога — бан."""
+        cfg = get_guild(guild.id)
+        prot = cfg["protection"]
+        if not prot.get("strict_mode") or actor is None or actor.bot:
+            return
+        if (actor.id == guild.owner_id or actor.id in prot["whitelist"]
+                or actor.id == self.bot.user.id):
+            return
+
+        warns = cfg.setdefault("warnings", {})
+        threshold = prot.get("strict_threshold", 3)
+        count = warns.get(str(actor.id), 0) + 1
+        warns[str(actor.id)] = count
+
+        if count >= threshold:
+            warns[str(actor.id)] = 0
+            save_guild(guild.id, cfg)
+            member = guild.get_member(actor.id)
+            banned = False
+            if member:
+                try:
+                    await guild.ban(member, reason=f"Усиленная защита: {threshold} предупреждения",
+                                    delete_message_seconds=0)
+                    banned = True
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+            ban_note = ("Забанен." if banned else
+                        "НЕ забанен — не хватило прав (поднимите роль бота выше нарушителя).")
+            await self._log(guild, discord.Embed(
+                title="⛔ Усиленная защита: бан",
+                description=f"{actor.mention} (`{actor.id}`) набрал {threshold} предупреждения.\n"
+                            f"{ban_note}\n"
+                            f"**Последнее действие:** {reason}",
+                color=discord.Color.dark_red()))
+        else:
+            save_guild(guild.id, cfg)
+            await self._log(guild, discord.Embed(
+                title="⚠️ Усиленная защита: предупреждение",
+                description=f"{actor.mention} получил предупреждение **{count}/{threshold}**.\n"
+                            f"**Действие:** {reason}",
+                color=discord.Color.orange()))
+
+    # ---------- Слушатели опасных действий ----------
+
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel):
         actor = await self._find_actor(channel.guild, discord.AuditLogAction.channel_delete)
         await self._register_nuke_action(channel.guild, actor, "удаление каналов")
+        await self._strict_warn(channel.guild, actor, f"удаление канала «{channel.name}»")
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role):
         actor = await self._find_actor(role.guild, discord.AuditLogAction.role_delete)
         await self._register_nuke_action(role.guild, actor, "удаление ролей")
+        await self._strict_warn(role.guild, actor, f"удаление роли «{role.name}»")
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild, user):
         actor = await self._find_actor(guild, discord.AuditLogAction.ban, target_id=user.id)
         await self._register_nuke_action(guild, actor, "массовые баны")
+        await self._strict_warn(guild, actor, f"бан участника {user}")
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member):
+        # ловим именно кик (выход по своей воле не наказываем)
+        if not get_guild(member.guild.id)["protection"].get("strict_mode"):
+            return
+        actor = await self._find_actor_kick(member.guild, member.id)
+        if actor:
+            await self._strict_warn(member.guild, actor, f"кик участника {member}")
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before, after):
+        # наказываем за снятие ролей у участников
+        if not get_guild(before.guild.id)["protection"].get("strict_mode"):
+            return
+        removed = set(before.roles) - set(after.roles)
+        if not removed:
+            return
+        actor = await self._find_actor(before.guild,
+                                       discord.AuditLogAction.member_role_update,
+                                       target_id=after.id)
+        if actor:
+            names = ", ".join(r.name for r in removed)
+            await self._strict_warn(before.guild, actor, f"снятие ролей ({names}) у {after}")
 
 
 # ==========================================================================
@@ -504,7 +672,8 @@ class Tickets(commands.Cog):
 # ==========================================================================
 
 TOGGLES = {"антиспам": "antispam", "антиинвайт": "antiinvite",
-           "антирейд": "antiraid", "антинюк": "antinuke"}
+           "антирейд": "antiraid", "антинюк": "antinuke",
+           "усиленная защита": "strict_mode"}
 
 
 class Config(commands.Cog):
@@ -566,6 +735,8 @@ class Config(commands.Cog):
             f"{yn(p['antiinvite'])} Анти-инвайт\n"
             f"{yn(p['antiraid'])} Анти-рейд ({p['antiraid_joins']}/{p['antiraid_interval']}с)\n"
             f"{yn(p['antinuke'])} Анти-нюк ({p['antinuke_limit']}/{p['antinuke_interval']}с)\n"
+            f"{yn(p.get('strict_mode'))} Усиленная защита "
+            f"(бан за {p.get('strict_threshold', 3)} преда)\n"
             f"Логи: {log_ch}\nБелый список: {wl}"), inline=False)
         cat = f"<#{t['category']}>" if t["category"] else "не задана"
         role = f"<@&{t['support_role']}>" if t["support_role"] else "не задана"
@@ -573,7 +744,70 @@ class Config(commands.Cog):
         embed.add_field(name="🎫 Тикеты", value=(
             f"Категория: {cat}\nРоль поддержки: {role}\nЛоги: {tlog}\n"
             f"Открыто сейчас: {len(t['open'])}"), inline=False)
+        warns = cfg.get("warnings", {})
+        active = {u: c for u, c in warns.items() if c > 0}
+        if active:
+            embed.add_field(name="⚠️ Предупреждения", value=(
+                "\n".join(f"<@{u}> — {c}" for u, c in active.items())), inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ---------- Меню ролей (кастомный эмбед с селектом) ----------
+
+    @app_commands.command(name="rolemenu",
+                          description="Создать эмбед с выпадающим меню выбора ролей")
+    @app_commands.describe(
+        channel="Канал для эмбеда", title="Заголовок эмбеда", description="Текст эмбеда",
+        role1="Роль 1", role2="Роль 2", role3="Роль 3", role4="Роль 4", role5="Роль 5",
+        color="Цвет в HEX, напр. #5865F2 (необязательно)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def rolemenu(self, interaction, channel: discord.TextChannel, title: str,
+                       description: str, role1: discord.Role, role2: discord.Role = None,
+                       role3: discord.Role = None, role4: discord.Role = None,
+                       role5: discord.Role = None, color: str = None):
+        roles = [r for r in (role1, role2, role3, role4, role5) if r]
+        # предупреждаем, если бот не сможет выдавать какие-то роли
+        too_high = [r.name for r in roles if r >= interaction.guild.me.top_role]
+        options = [{"id": r.id, "label": r.name} for r in roles]
+
+        embed = discord.Embed(title=title, description=description, color=parse_color(color))
+        view = build_rolemenu_view(options)
+        try:
+            msg = await channel.send(embed=embed, view=view)
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                f"Нет прав писать в {channel.mention}.", ephemeral=True)
+
+        cfg = get_guild(interaction.guild.id)
+        cfg.setdefault("menus", {})[str(msg.id)] = {"channel": channel.id, "options": options}
+        save_guild(interaction.guild.id, cfg)
+        self.bot.add_view(view, message_id=msg.id)  # чтобы работало сразу
+
+        note = ""
+        if too_high:
+            note = ("\n⚠️ Роль бота ниже этих ролей — их не получится выдавать: "
+                    + ", ".join(too_high) + ". Поднимите роль бота выше в настройках сервера.")
+        await interaction.response.send_message(
+            f"✅ Меню ролей размещено в {channel.mention}.{note}", ephemeral=True)
+
+    # ---------- Управление предупреждениями ----------
+
+    @app_commands.command(name="warnings", description="Показать предупреждения пользователя")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def warnings(self, interaction, пользователь: discord.Member):
+        cfg = get_guild(interaction.guild.id)
+        count = cfg.get("warnings", {}).get(str(пользователь.id), 0)
+        threshold = cfg["protection"].get("strict_threshold", 3)
+        await interaction.response.send_message(
+            f"{пользователь.mention}: **{count}/{threshold}** предупреждений.", ephemeral=True)
+
+    @app_commands.command(name="warnings_reset", description="Сбросить предупреждения пользователя")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def warnings_reset(self, interaction, пользователь: discord.Member):
+        cfg = get_guild(interaction.guild.id)
+        cfg.setdefault("warnings", {})[str(пользователь.id)] = 0
+        save_guild(interaction.guild.id, cfg)
+        await interaction.response.send_message(
+            f"✅ Предупреждения {пользователь.mention} сброшены.", ephemeral=True)
 
 
 # ==========================================================================
@@ -593,6 +827,19 @@ class GuardBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(TicketPanelView())
         self.add_view(TicketControlView())
+
+        # восстанавливаем меню ролей, чтобы селекты работали после перезапуска
+        restored = 0
+        for gset in load_all().values():
+            for mid, menu in gset.get("menus", {}).items():
+                try:
+                    self.add_view(build_rolemenu_view(menu["options"]), message_id=int(mid))
+                    restored += 1
+                except Exception as e:
+                    log.warning("Не удалось восстановить меню %s: %s", mid, e)
+        if restored:
+            log.info("Восстановлено меню ролей: %d", restored)
+
         await self.add_cog(Protection(self))
         await self.add_cog(Tickets(self))
         await self.add_cog(Config(self))
