@@ -69,6 +69,8 @@ _DEFAULT_GUILD = {
     },
     "warnings": {},                 # {user_id: количество предупреждений}
     "menus": {},                    # {message_id: {"channel": id, "options": [...]}}
+    "panel_channel": None,          # канал постоянной панели управления
+    "panel_message": None,          # id сообщения постоянной панели
     "tickets": {
         "category": None,
         "support_role": None,
@@ -967,7 +969,7 @@ class BackButton(discord.ui.Button):
         super().__init__(label="◀ Назад", style=discord.ButtonStyle.secondary, row=4)
 
     async def callback(self, interaction):
-        view = MainPanelView(interaction.guild.id)
+        view = EphemeralMainView(interaction.guild.id)
         await interaction.response.edit_message(embed=view.embed(), view=view)
 
 
@@ -980,30 +982,82 @@ class CloseButton(discord.ui.Button):
             content="Панель закрыта.", embed=None, view=None)
 
 
-# ---------- Главное меню ----------
+def panel_main_embed(guild_id):
+    """Статус-эмбед главного меню (общий для постоянной и приватной панели)."""
+    cfg = get_guild(guild_id)
+    p, t = cfg["protection"], cfg["tickets"]
+    yn = lambda v: "✅" if v else "❌"
+    prot = " ".join(f"{yn(p.get(k))}{PROT_LABELS[k]}" for k in PROT_LABELS)
+    types = ", ".join(x["label"] for x in t.get("types", [])) or "нет"
+    e = discord.Embed(
+        title="🎛️ Панель управления",
+        description="Нажмите кнопку раздела — настройки откроются лично вам.",
+        color=discord.Color.blurple())
+    e.add_field(name="🛡️ Защита", value=prot, inline=False)
+    e.add_field(name="🎫 Тикеты",
+                value=f"Типы: {types}\nОткрыто: {len(t.get('open', {}))}", inline=False)
+    log_ch = f"<#{cfg['log_channel']}>" if cfg["log_channel"] else "не задан"
+    tlog = f"<#{t['log_channel']}>" if t.get("log_channel") else "не задан"
+    e.add_field(name="⚙️ Логи", value=f"Защита: {log_ch}\nТикеты: {tlog}", inline=False)
+    return e
 
-class MainPanelView(discord.ui.View):
+
+def _panel_deny(interaction):
+    """True + ответ, если нажавший не администратор."""
+    if interaction.user.guild_permissions.administrator:
+        return False
+    return True
+
+
+# ---------- Постоянная панель в канале (статичное сообщение) ----------
+
+class PersistentPanelView(discord.ui.View):
+    """Живёт в канале постоянно. Само сообщение не меняется от навигации —
+    разделы открываются приватно (ephemeral) каждому нажавшему."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _open(self, interaction, view):
+        if _panel_deny(interaction):
+            return await interaction.response.send_message(
+                "Эта панель только для администраторов.", ephemeral=True)
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="🛡️ Защита", style=discord.ButtonStyle.primary,
+                       custom_id="panel:prot")
+    async def prot(self, interaction, button):
+        await self._open(interaction, ProtectionPanelView(interaction.guild.id))
+
+    @discord.ui.button(label="🎫 Тикеты", style=discord.ButtonStyle.primary,
+                       custom_id="panel:tickets")
+    async def tickets(self, interaction, button):
+        await self._open(interaction, TicketsPanelView(interaction.guild.id))
+
+    @discord.ui.button(label="⚙️ Логи", style=discord.ButtonStyle.primary,
+                       custom_id="panel:logs")
+    async def logs(self, interaction, button):
+        await self._open(interaction, LogsPanelView(interaction.guild.id))
+
+    @discord.ui.button(label="🔄 Обновить", style=discord.ButtonStyle.secondary,
+                       custom_id="panel:refresh")
+    async def refresh(self, interaction, button):
+        if _panel_deny(interaction):
+            return await interaction.response.send_message(
+                "Только для администраторов.", ephemeral=True)
+        await interaction.response.edit_message(
+            embed=panel_main_embed(interaction.guild.id), view=PersistentPanelView())
+
+
+# ---------- Приватное главное меню (внутри личной сессии) ----------
+
+class EphemeralMainView(discord.ui.View):
     def __init__(self, guild_id):
         super().__init__(timeout=300)
         self.guild_id = guild_id
 
     def embed(self):
-        cfg = get_guild(self.guild_id)
-        p, t = cfg["protection"], cfg["tickets"]
-        yn = lambda v: "✅" if v else "❌"
-        prot = " ".join(f"{yn(p.get(k))}{PROT_LABELS[k]}" for k in PROT_LABELS)
-        types = ", ".join(x["label"] for x in t.get("types", [])) or "нет"
-        e = discord.Embed(
-            title="🎛️ Панель управления",
-            description="Выберите раздел кнопками ниже.",
-            color=discord.Color.blurple())
-        e.add_field(name="🛡️ Защита", value=prot, inline=False)
-        e.add_field(name="🎫 Тикеты",
-                    value=f"Типы: {types}\nОткрыто: {len(t.get('open', {}))}", inline=False)
-        log_ch = f"<#{cfg['log_channel']}>" if cfg["log_channel"] else "не задан"
-        tlog = f"<#{t['log_channel']}>" if t.get("log_channel") else "не задан"
-        e.add_field(name="⚙️ Логи", value=f"Защита: {log_ch}\nТикеты: {tlog}", inline=False)
-        return e
+        return panel_main_embed(self.guild_id)
 
     @discord.ui.button(label="🛡️ Защита", style=discord.ButtonStyle.primary)
     async def protection(self, interaction, button):
@@ -1188,11 +1242,31 @@ class Config(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="panel",
-                          description="Открыть общую панель управления ботом")
+                          description="Открыть панель управления лично (разово)")
     @app_commands.checks.has_permissions(administrator=True)
     async def panel(self, interaction):
-        view = MainPanelView(interaction.guild.id)
+        view = EphemeralMainView(interaction.guild.id)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+
+    @app_commands.command(name="panel_setup",
+                          description="Разместить постоянную панель управления в канале")
+    @app_commands.describe(channel="Канал для постоянной панели (лучше закрытый, для админов)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def panel_setup(self, interaction, channel: discord.TextChannel):
+        try:
+            msg = await channel.send(embed=panel_main_embed(interaction.guild.id),
+                                     view=PersistentPanelView())
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                f"Нет прав писать в {channel.mention}.", ephemeral=True)
+        cfg = get_guild(interaction.guild.id)
+        cfg["panel_channel"] = channel.id
+        cfg["panel_message"] = msg.id
+        save_guild(interaction.guild.id, cfg)
+        await interaction.response.send_message(
+            f"✅ Постоянная панель размещена в {channel.mention}.\n"
+            f"Само сообщение статично, а разделы открываются приватно каждому админу. "
+            f"Убедитесь, что канал виден только администрации.", ephemeral=True)
 
     @app_commands.command(name="set_log", description="Задать канал логов защиты")
     @app_commands.checks.has_permissions(administrator=True)
@@ -1345,6 +1419,7 @@ class GuardBot(commands.Bot):
         self.add_view(TicketPanelView())
         self.add_view(TicketControlView())
         self.add_view(TicketSelectView())
+        self.add_view(PersistentPanelView())
 
         # восстанавливаем меню ролей, чтобы селекты работали после перезапуска
         restored = 0
