@@ -65,6 +65,8 @@ _DEFAULT_GUILD = {
         "antinuke_interval": 12,
         "strict_mode": False,       # усиленная защита (преды + автобан)
         "strict_threshold": 3,      # сколько предупреждений до бана
+        "antibot": True,            # банить любого бота, кроме разрешённых
+        "bot_whitelist": [],        # id разрешённых ботов (не банятся)
         "whitelist": [],
     },
     "warnings": {},                 # {user_id: количество предупреждений}
@@ -580,6 +582,30 @@ class Protection(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member):
         prot = get_guild(member.guild.id)["protection"]
+
+        # --- Антибот: банить любого бота, кроме разрешённых ---
+        if member.bot and prot.get("antibot", True):
+            if (member.id not in prot.get("bot_whitelist", [])
+                    and member.id != self.bot.user.id):
+                adder = await self._find_actor(
+                    member.guild, discord.AuditLogAction.bot_add, target_id=member.id)
+                try:
+                    await member.guild.ban(
+                        member, reason="Антибот: неразрешённый бот", delete_message_seconds=0)
+                    banned = True
+                except (discord.Forbidden, discord.HTTPException):
+                    banned = False
+                who = adder.mention if adder else "неизвестно"
+                await self._log(member.guild, discord.Embed(
+                    title="🤖⛔ Антибот",
+                    description=f"Бот **{member}** (`{member.id}`) "
+                                f"{'забанен' if banned else 'НЕ забанен (не хватило прав)'}.\n"
+                                f"**Кто добавил:** {who}\n\n"
+                                f"Если бот нужен — добавьте его в разрешённые "
+                                f"командой `/bot_allow` и разбаньте.",
+                    color=discord.Color.dark_red()))
+                return  # дальше анти-рейд для бота не нужен
+
         if not prot["antiraid"]:
             return
         now = time.time()
@@ -951,12 +977,12 @@ class Tickets(commands.Cog):
 
 TOGGLES = {"антиспам": "antispam", "антиинвайт": "antiinvite",
            "антирейд": "antiraid", "антинюк": "antinuke",
-           "усиленная защита": "strict_mode"}
+           "усиленная защита": "strict_mode", "антибот": "antibot"}
 
 # читаемые названия для панели
 PROT_LABELS = {
     "antispam": "Анти-спам", "antiinvite": "Анти-инвайт", "antiraid": "Анти-рейд",
-    "antinuke": "Анти-нюк", "strict_mode": "Усиленная защита",
+    "antinuke": "Анти-нюк", "strict_mode": "Усиленная защита", "antibot": "Антибот",
 }
 
 
@@ -1308,6 +1334,47 @@ class Config(commands.Cog):
             save_guild(interaction.guild.id, cfg)
         await interaction.response.send_message(
             f"✅ {пользователь.mention} убран из белого списка.", ephemeral=True)
+
+    @app_commands.command(name="bot_allow",
+                          description="Разрешить бота (антибот не будет его банить)")
+    @app_commands.describe(bot="Бот, которого разрешить (упоминанием или ID)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def allow_bot(self, interaction, bot: discord.Member):
+        if not bot.bot:
+            return await interaction.response.send_message(
+                "Это не бот.", ephemeral=True)
+        cfg = get_guild(interaction.guild.id)
+        bl = cfg["protection"].setdefault("bot_whitelist", [])
+        if bot.id not in bl:
+            bl.append(bot.id)
+            save_guild(interaction.guild.id, cfg)
+        await interaction.response.send_message(
+            f"✅ Бот {bot.mention} разрешён. Если он был забанен — разбаньте его вручную.",
+            ephemeral=True)
+
+    @app_commands.command(name="bot_disallow", description="Убрать бота из разрешённых")
+    @app_commands.describe(bot_id="ID бота")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def disallow_bot(self, interaction, bot_id: str):
+        if not bot_id.isdigit():
+            return await interaction.response.send_message("Укажите числовой ID.", ephemeral=True)
+        cfg = get_guild(interaction.guild.id)
+        bl = cfg["protection"].setdefault("bot_whitelist", [])
+        bid = int(bot_id)
+        if bid in bl:
+            bl.remove(bid)
+            save_guild(interaction.guild.id, cfg)
+        await interaction.response.send_message(
+            f"✅ Бот `{bot_id}` убран из разрешённых.", ephemeral=True)
+
+    @app_commands.command(name="bots_allowed", description="Список разрешённых ботов")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def list_allowed_bots(self, interaction):
+        cfg = get_guild(interaction.guild.id)
+        bl = cfg["protection"].get("bot_whitelist", [])
+        text = "\n".join(f"<@{b}> (`{b}`)" for b in bl) or "пусто"
+        await interaction.response.send_message(
+            f"🤖 Разрешённые боты:\n{text}", ephemeral=True)
 
     @app_commands.command(name="settings", description="Показать настройки сервера")
     @app_commands.checks.has_permissions(administrator=True)
