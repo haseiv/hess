@@ -57,6 +57,8 @@ _DEFAULT_GUILD = {
         "antispam_interval": 5,
         "antispam_timeout": 300,
         "antiinvite": True,
+        "antilink": False,          # тайм-аут за любые ссылки
+        "antilink_timeout": 3600,   # длительность тайм-аута, сек (1 час)
         "antiraid": True,
         "antiraid_joins": 6,
         "antiraid_interval": 10,
@@ -478,6 +480,10 @@ def build_rolemenu_view(options):
 # ==========================================================================
 
 INVITE_RE = re.compile(r"(discord\.gg/|discord(app)?\.com/invite/)", re.IGNORECASE)
+LINK_RE = re.compile(
+    r"(https?://\S+|www\.\S+|\b[a-z0-9-]+\.(?:com|net|org|gg|io|ru|xyz|me|tv|co|app|dev|"
+    r"info|biz|link|shop|store|online|site|club|fun|top|pw|cc)\b\S*)",
+    re.IGNORECASE)
 
 
 class Protection(commands.Cog):
@@ -549,6 +555,41 @@ class Protection(commands.Cog):
             await self._log(message.guild, discord.Embed(
                 title="🔗 Удалено приглашение",
                 description=f"**Автор:** {member.mention}\n**Канал:** {message.channel.mention}",
+                color=discord.Color.orange()))
+            return
+
+        if prot.get("antilink") and LINK_RE.search(message.content):
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+            secs = prot.get("antilink_timeout", 3600)
+            muted = False
+            try:
+                await member.timeout(timedelta(seconds=secs),
+                                     reason="Антиссылки: отправка ссылки")
+                muted = True
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            # предупреждение ЛИЧНО нарушителю (в ЛС), без спама в канал
+            hours = max(1, round(secs / 3600))
+            warn = (f"На сервере **{message.guild.name}** запрещена отправка ссылок. "
+                    f"Ваше сообщение удалено"
+                    + (f", выдан тайм-аут на {hours} ч." if muted else "."))
+            try:
+                await member.send(warn)
+            except discord.HTTPException:
+                # если ЛС закрыты — короткое авто-удаляемое сообщение в канале
+                try:
+                    await message.channel.send(f"{member.mention}, ссылки запрещены.",
+                                               delete_after=7)
+                except discord.HTTPException:
+                    pass
+            await self._log(message.guild, discord.Embed(
+                title="🔗 Антиссылки",
+                description=f"**Автор:** {member.mention}\n"
+                            f"**Канал:** {message.channel.mention}\n"
+                            f"{'Выдан тайм-аут на ' + str(hours) + ' ч.' if muted else 'Тайм-аут не выдан (нет прав).'}",
                 color=discord.Color.orange()))
             return
 
@@ -976,13 +1017,15 @@ class Tickets(commands.Cog):
 # ==========================================================================
 
 TOGGLES = {"антиспам": "antispam", "антиинвайт": "antiinvite",
+           "антиссылки": "antilink",
            "антирейд": "antiraid", "антинюк": "antinuke",
            "усиленная защита": "strict_mode", "антибот": "antibot"}
 
 # читаемые названия для панели
 PROT_LABELS = {
-    "antispam": "Анти-спам", "antiinvite": "Анти-инвайт", "antiraid": "Анти-рейд",
-    "antinuke": "Анти-нюк", "strict_mode": "Усиленная защита", "antibot": "Антибот",
+    "antispam": "Анти-спам", "antiinvite": "Анти-инвайт", "antilink": "Антиссылки",
+    "antiraid": "Анти-рейд", "antinuke": "Анти-нюк", "strict_mode": "Усиленная защита",
+    "antibot": "Антибот",
 }
 
 
@@ -1388,8 +1431,11 @@ class Config(commands.Cog):
         embed.add_field(name="🛡️ Защита", value=(
             f"{yn(p['antispam'])} Анти-спам ({p['antispam_limit']}/{p['antispam_interval']}с)\n"
             f"{yn(p['antiinvite'])} Анти-инвайт\n"
+            f"{yn(p.get('antilink'))} Антиссылки (тайм-аут "
+            f"{max(1, round(p.get('antilink_timeout', 3600)/3600))} ч)\n"
             f"{yn(p['antiraid'])} Анти-рейд ({p['antiraid_joins']}/{p['antiraid_interval']}с)\n"
             f"{yn(p['antinuke'])} Анти-нюк ({p['antinuke_limit']}/{p['antinuke_interval']}с)\n"
+            f"{yn(p.get('antibot', True))} Антибот\n"
             f"{yn(p.get('strict_mode'))} Усиленная защита "
             f"(бан за {p.get('strict_threshold', 3)} преда)\n"
             f"Логи: {log_ch}\nБелый список: {wl}"), inline=False)
