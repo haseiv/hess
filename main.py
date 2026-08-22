@@ -704,11 +704,10 @@ class ReportModal(discord.ui.Modal):
             f"✅ Отчёт отправлен на проверку: {msg.jump_url}", ephemeral=True)
 
 
-class ReviewButtons(discord.ui.DynamicItem):
+class ReviewButtons(discord.ui.DynamicItem,
+                    template=r"eco:(?P<action>approve|deny):(?P<user>\d+)"):
     """Кнопки одобрения/отклонения отчёта. user_id зашит в custom_id,
     поэтому кнопки работают даже после перезапуска бота."""
-
-    template = r"eco:(?P<action>approve|deny):(?P<user>\d+)"
 
     def __init__(self, user_id):
         self.report_user = user_id
