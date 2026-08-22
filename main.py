@@ -69,9 +69,23 @@ _DEFAULT_GUILD = {
         "strict_threshold": 3,      # сколько предупреждений до бана
         "antibot": True,            # банить любого бота, кроме разрешённых
         "bot_whitelist": [],        # id разрешённых ботов (не банятся)
+        "antimention": True,        # удалять @everyone/@here и флуд упоминаниями
+        "mention_limit": 6,         # сколько упоминаний = флуд
         "whitelist": [],
     },
     "warnings": {},                 # {user_id: количество предупреждений}
+    "economy": {
+        "emoji": "🪙",              # символ валюты
+        "review_channel": None,     # канал проверки отчётов
+        "reward": 100,              # награда за одобренный отчёт
+        "counter": 0,               # номера отчётов
+        "open": {},                 # {message_id: {"user": id, "status": ...}}
+    },
+    "shop": {
+        "items": [],                # [{"name","price","description","emoji","role","stock"}]
+        "log_channel": None,        # канал логов покупок
+    },
+    "coins": {},                    # {user_id: баланс монет}
     "menus": {},                    # {message_id: {"channel": id, "options": [...]}}
     "panel_channel": None,          # канал постоянной панели управления
     "panel_message": None,          # id сообщения постоянной панели
@@ -476,6 +490,298 @@ def build_rolemenu_view(options):
 
 
 # ==========================================================================
+#  ЭКОНОМИКА: монеты, магазин, отчёты
+# ==========================================================================
+
+def _eco_get_coins(cfg, user_id):
+    return cfg.get("coins", {}).get(str(user_id), 0)
+
+
+def _eco_change_coins(cfg, user_id, delta):
+    """Изменить баланс; при списании баланс не уходит ниже нуля."""
+    bal = cfg.setdefault("coins", {})
+    cur = bal.get(str(user_id), 0)
+    bal[str(user_id)] = max(0, cur + delta)
+    return bal[str(user_id)]
+
+
+class ShopSelect(discord.ui.Select):
+    """Селект магазина: value каждой опции = название товара, поэтому меню
+    не хранит состояние и переживает перезапуск бота."""
+
+    def __init__(self):
+        super().__init__(custom_id="shop:select",
+                         placeholder="Выберите товар для покупки",
+                         min_values=1, max_values=1, options=[
+                             discord.SelectOption(label="Магазин пуст", value="—")])
+
+    def refresh(self, items):
+        opts = [
+            discord.SelectOption(
+                label=f"{it['name']} — {it['price']}🪙"[:100],
+                value=it["name"][:100],
+                description=(it.get("description") or None)[:100] if it.get("description") else None,
+                emoji=(it.get("emoji") or None))
+            for it in (items or [])
+        ]
+        if opts:
+            self.options = opts
+        return self
+
+    async def callback(self, interaction: discord.Interaction):
+        cfg = get_guild(interaction.guild.id)
+        items = cfg["shop"].get("items", [])
+        chosen = self.values[0]
+        it = next((x for x in items if x["name"] == chosen), None)
+        if it is None:
+            return await interaction.response.send_message(
+                "Этот товар больше недоступен.", ephemeral=True)
+
+        balance = _eco_get_coins(cfg, interaction.user.id)
+        stock = it.get("stock")
+        stock_line = f"В наличии: **{stock}**" if stock is not None else "В наличии: ∞"
+        e = discord.Embed(title="🛒 Покупка",
+                          color=discord.Color.gold())
+        emoji = (it.get("emoji") + " ") if it.get("emoji") else ""
+        e.add_field(name=f"{emoji}{it['name']}", value=(
+            f"**Цена:** {it['price']}🪙\n{stock_line}\n"
+            f"{it.get('description') or ''}"), inline=False)
+        role = interaction.guild.get_role(it["role"]) if it.get("role") else None
+        if role:
+            e.add_field(name="Роль", value=role.mention, inline=False)
+        e.add_field(name="Ваш баланс", value=f"**{balance}**🪙", inline=True)
+        await interaction.response.send_message(
+            embed=e, view=ConfirmBuyView(it["name"]), ephemeral=True)
+
+
+class ShopPanelView(discord.ui.View):
+    """Постоянная панель магазина в канале."""
+
+    def __init__(self, with_items=None):
+        super().__init__(timeout=None)
+        sel = ShopSelect()
+        if with_items:
+            sel.refresh(with_items)
+        self.add_item(sel)
+
+
+class ConfirmBuyView(discord.ui.View):
+    """Подтверждение покупки (эфемерное — живёт до перезапуска, ок)."""
+
+    def __init__(self, item_name):
+        super().__init__(timeout=120)
+        self.item_name = item_name
+
+    async def _finish(self, text, interaction):
+        for c in self.children:
+            c.disabled = True
+        try:
+            await interaction.response.edit_message(content=text, view=self)
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="Купить", style=discord.ButtonStyle.success, emoji="✅")
+    async def buy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = get_guild(interaction.guild.id)
+        it = next((x for x in cfg["shop"].get("items", [])
+                   if x["name"] == self.item_name), None)
+        if it is None:
+            return await self._finish("❌ Товар уже не продаётся.", interaction)
+
+        price = it.get("price", 0)
+        balance = _eco_get_coins(cfg, interaction.user.id)
+        if balance < price:
+            return await self._finish(
+                f"❌ Не хватает монет: нужно **{price}**, у вас **{balance}**.", interaction)
+
+        stock = it.get("stock")
+        if stock is not None:
+            if stock <= 0:
+                return await self._finish("❌ Товар распродан.", interaction)
+            it["stock"] = stock - 1
+
+        new_balance = _eco_change_coins(cfg, interaction.user.id, -price)
+        save_guild(interaction.guild.id, cfg)
+
+        role_line = ""
+        role = interaction.guild.get_role(it["role"]) if it.get("role") else None
+        if role:
+            member = interaction.guild.get_member(interaction.user.id) or interaction.user
+            if role >= interaction.guild.me.top_role:
+                role_line = ("\n⚠️ Роль бота ниже нужной роли — она НЕ выдана, "
+                             "обратитесь к администрации.")
+            else:
+                try:
+                    await member.add_roles(role, reason=f"Покупка в магазине: {it['name']}")
+                    role_line = f"\n✅ Выдана роль {role.mention}."
+                except discord.Forbidden:
+                    role_line = ("\n⚠️ Не хватило прав выдать роль — "
+                                 "обратитесь к администрации.")
+
+        log_ch = (interaction.guild.get_channel(cfg["shop"]["log_channel"])
+                  if cfg["shop"].get("log_channel") else None)
+        if log_ch:
+            try:
+                await log_ch.send(embed=discord.Embed(
+                    title="🛒 Покупка",
+                    description=f"{interaction.user.mention} купил **{it['name']}** "
+                                f"за **{price}**🪙.",
+                    color=discord.Color.gold()))
+            except discord.HTTPException:
+                pass
+
+        await self._finish(
+            f"✅ Куплено: **{it['name']}** за **{price}**🪙.\n"
+            f"Остаток: **{new_balance}**🪙.{role_line}", interaction)
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish("Покупка отменена.", interaction)
+
+
+class ReportPanelView(discord.ui.View):
+    """Постоянная панель подачи отчётов на монеты."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Подать отчёт на монеты", style=discord.ButtonStyle.primary,
+                       emoji="📝", custom_id="eco:report")
+    async def report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        eco = get_guild(interaction.guild.id)["economy"]
+        if not eco.get("review_channel"):
+            return await interaction.response.send_message(
+                "Отчёты ещё не настроены. Обратитесь к администрации.", ephemeral=True)
+        await interaction.response.send_modal(ReportModal())
+
+
+class ReportModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Отчёт на монеты")
+        self.what = discord.ui.TextInput(
+            label="Что было сделано", style=discord.TextStyle.paragraph,
+            required=True, max_length=1500,
+            placeholder="Опишите, что вы сделали за отчётный период...")
+        self.proof = discord.ui.TextInput(
+            label="Доказательства / ссылка", style=discord.TextStyle.short,
+            required=False, max_length=300,
+            placeholder="Ссылка на скриншот/работу или описание")
+        self.add_item(self.what)
+        self.add_item(self.proof)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        cfg = get_guild(guild.id)
+        eco = cfg["economy"]
+        ch = guild.get_channel(eco.get("review_channel"))
+        if ch is None:
+            return await interaction.followup.send(
+                "Канал проверки отчётов недоступен. Обратитесь к администрации.",
+                ephemeral=True)
+
+        eco["counter"] += 1
+        number = eco["counter"]
+        e = discord.Embed(
+            title=f"📝 Отчёт #{number:04d}",
+            description=self.what.value[:2000],
+            color=discord.Color.blurple(), timestamp=discord.utils.utcnow())
+        e.add_field(name="Автор", value=interaction.user.mention, inline=True)
+        e.add_field(name="Награда", value=f"{eco.get('reward', 0)}🪙", inline=True)
+        if self.proof.value:
+            e.add_field(name="Доказательства", value=self.proof.value[:1024], inline=False)
+        view = ReviewButtons(interaction.user.id)
+        try:
+            msg = await ch.send(embed=e, view=view)
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "Не удалось отправить отчёт (нет прав в канале проверки).", ephemeral=True)
+
+        eco.setdefault("open", {})[str(msg.id)] = {
+            "user": interaction.user.id, "status": "pending"}
+        save_guild(guild.id, cfg)
+        await interaction.followup.send(
+            f"✅ Отчёт отправлен на проверку: {msg.jump_url}", ephemeral=True)
+
+
+class ReviewButtons(discord.ui.DynamicItem):
+    """Кнопки одобрения/отклонения отчёта. user_id зашит в custom_id,
+    поэтому кнопки работают даже после перезапуска бота."""
+
+    template = r"eco:(?P<action>approve|deny):(?P<user>\d+)"
+
+    def __init__(self, user_id):
+        self.report_user = user_id
+        approve = discord.ui.Button(label="Одобрить", style=discord.ButtonStyle.success,
+                                    emoji="✅",
+                                    custom_id=f"eco:approve:{user_id}")
+        deny = discord.ui.Button(label="Отклонить", style=discord.ButtonStyle.danger,
+                                 emoji="❌",
+                                 custom_id=f"eco:deny:{user_id}")
+        super().__init__(approve, deny)
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["user"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        action = self.custom_id.split(":")[1]
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "Только администраторы могут проверять отчёты.", ephemeral=True)
+
+        cfg = get_guild(interaction.guild.id)
+        eco = cfg["economy"]
+        rec = eco.setdefault("open", {}).get(str(interaction.message.id))
+        if rec and rec.get("status") != "pending":
+            return await interaction.response.send_message(
+                "Этот отчёт уже обработан.", ephemeral=True)
+
+        reward = eco.get("reward", 0)
+        user = interaction.guild.get_member(self.report_user)
+        mention = user.mention if user else f"<@{self.report_user}>"
+
+        if rec:
+            rec["status"] = "approved" if action == "approve" else "denied"
+            rec["reviewer"] = interaction.user.id
+
+        if action == "approve":
+            balance = _eco_change_coins(cfg, self.report_user, reward)
+            save_guild(interaction.guild.id, cfg)
+            if user:
+                try:
+                    await user.send(f"✅ Ваш отчёт на сервере **{interaction.guild.name}** "
+                                    f"одобрен: +{reward}🪙. Баланс: **{balance}**🪙.")
+                except discord.HTTPException:
+                    pass
+            e = interaction.message.embeds[0] if interaction.message.embeds else None
+            if e:
+                e.color = discord.Color.green()
+                e.add_field(name="Результат", value=f"Одобрено {interaction.user.mention}: "
+                                                    f"+{reward}🪙", inline=False)
+            for c in self.children:
+                c.disabled = True
+            await interaction.response.edit_message(embed=e, view=self)
+        else:
+            if rec:
+                save_guild(interaction.guild.id, cfg)
+            e = interaction.message.embeds[0] if interaction.message.embeds else None
+            if e:
+                e.color = discord.Color.red()
+                e.add_field(name="Результат",
+                            value=f"Отклонено {interaction.user.mention}", inline=False)
+            for c in self.children:
+                c.disabled = True
+            await interaction.response.edit_message(embed=e, view=self)
+            if user:
+                try:
+                    await user.send(f"❌ Ваш отчёт на сервере **{interaction.guild.name}** "
+                                    f"отклонён. Уточните у администрации причину.")
+                except discord.HTTPException:
+                    pass
+
+
+# ==========================================================================
 #  COG: ЗАЩИТА
 # ==========================================================================
 
@@ -557,6 +863,29 @@ class Protection(commands.Cog):
                 description=f"**Автор:** {member.mention}\n**Канал:** {message.channel.mention}",
                 color=discord.Color.orange()))
             return
+
+        # анти-упоминания: @everyone/@here и флуд упоминаниями
+        if prot.get("antimention", True):
+            everyone_ping = ("@everyone" in message.content
+                             or "@here" in message.content)
+            mention_count = len(message.mentions) + len(message.mention_roles)
+            limit = prot.get("mention_limit", 6)
+            if everyone_ping or mention_count >= limit:
+                try:
+                    await message.delete()
+                    await message.channel.send(
+                        f"{member.mention}, массовые упоминания запрещены.",
+                        delete_after=5)
+                except discord.HTTPException:
+                    pass
+                await self._log(message.guild, discord.Embed(
+                    title="📣 Удалены массовые упоминания",
+                    description=f"**Автор:** {member.mention}\n"
+                                f"**Канал:** {message.channel.mention}\n"
+                                f"@everyone/@here: {'да' if everyone_ping else 'нет'}, "
+                                f"упоминаний: {mention_count}",
+                    color=discord.Color.orange()))
+                return
 
         if prot.get("antilink") and LINK_RE.search(message.content):
             try:
@@ -784,6 +1113,45 @@ class Protection(commands.Cog):
         if actor:
             names = ", ".join(r.name for r in removed)
             await self._strict_warn(before.guild, actor, f"снятие ролей ({names}) у {after}")
+
+    DANGEROUS_PERMS = ("administrator", "manage_guild", "manage_roles",
+                       "manage_channels", "manage_webhooks", "ban_members",
+                       "manage_nicknames", "moderate_members")
+
+    @commands.Cog.listener()
+    async def on_guild_role_update(self, before, after):
+        # выдача роли опасных прав — классика захвата сервера
+        gained = [p for p in self.DANGEROUS_PERMS
+                  if getattr(after.permissions, p) and not getattr(before.permissions, p)]
+        if not gained:
+            return
+        actor = await self._find_actor(after.guild, discord.AuditLogAction.role_update)
+        reason = f"выдача опасных прав роли «{after.name}»: {', '.join(gained)}"
+        await self._register_nuke_action(after.guild, actor, "раздача прав ролям")
+        await self._strict_warn(after.guild, actor, reason)
+
+    @commands.Cog.listener()
+    async def on_guild_update(self, before, after):
+        # смена названия/иконки/валюты сервера без ведома администрации
+        changed = []
+        if before.name != after.name:
+            changed.append(f"название → «{after.name}»")
+        if before.vanity_url_code != after.vanity_url_code:
+            changed.append("vanity-ссылка")
+        if not changed:
+            return
+        try:
+            entry = None
+            async for e in after.guild.audit_logs(limit=5,
+                                                  action=discord.AuditLogAction.guild_update):
+                entry = e
+                break
+        except (discord.Forbidden, discord.HTTPException):
+            entry = None
+        actor = entry.user if entry else None
+        await self._register_nuke_action(after.guild, actor, "изменение настроек сервера")
+        await self._strict_warn(after.guild, actor, "изменение настроек сервера: "
+                                + ", ".join(changed))
 
 
 # ==========================================================================
@@ -1013,19 +1381,204 @@ class Tickets(commands.Cog):
 
 
 # ==========================================================================
+#  COG: КОМАНДЫ ЭКОНОМИКИ
+# ==========================================================================
+
+class Economy(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    # ---------- Магазин: настройка товаров ----------
+
+    @app_commands.command(name="shop_add",
+                          description="Добавить/обновить товар в магазине")
+    @app_commands.describe(name="Название товара", price="Цена в монетах",
+                           description="Описание (необязательно)",
+                           emoji="Эмодзи (необязательно)",
+                           role="Роль-награда при покупке (необязательно)",
+                           stock="Количество на складе, пусто = ∞ (необязательно)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def shop_add(self, interaction, name: str, price: app_commands.Range[int, 0],
+                       description: str = None, emoji: str = None,
+                       role: discord.Role = None,
+                       stock: app_commands.Range[int, 0] = None):
+        cfg = get_guild(interaction.guild.id)
+        items = cfg["shop"].setdefault("items", [])
+        label = name[:100]
+        entry = {"name": label, "price": price, "description": description,
+                 "emoji": emoji or None, "role": role.id if role else None,
+                 "stock": stock}
+        existed = any(x["name"] == label for x in items)
+        items[:] = [x for x in items if x["name"] != label]
+        if len(items) >= 25:
+            return await interaction.response.send_message(
+                "Максимум 25 товаров (ограничение меню Discord).", ephemeral=True)
+        items.append(entry)
+        save_guild(interaction.guild.id, cfg)
+        action = "обновлён" if existed else "добавлен"
+        stock_line = f"склад: {stock if stock is not None else '∞'}"
+        await interaction.response.send_message(
+            f"✅ Товар **{label}** {action}: цена **{price}**🪙, {stock_line}"
+            + (f", роль {role.mention}" if role else "")
+            + ". Пересоздайте панель `/shop_panel`, чтобы товар появился.",
+            ephemeral=True)
+
+    @app_commands.command(name="shop_remove", description="Удалить товар из магазина")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def shop_remove(self, interaction, name: str):
+        cfg = get_guild(interaction.guild.id)
+        items = cfg["shop"].get("items", [])
+        before = len(items)
+        cfg["shop"]["items"] = [x for x in items if x["name"] != name]
+        save_guild(interaction.guild.id, cfg)
+        if len(cfg["shop"]["items"]) < before:
+            await interaction.response.send_message(
+                f"✅ Товар **{name}** удалён.", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                f"Товар **{name}** не найден.", ephemeral=True)
+
+    @app_commands.command(name="shop_list", description="Список товаров магазина")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def shop_list(self, interaction):
+        cfg = get_guild(interaction.guild.id)
+        items = cfg["shop"].get("items", [])
+        if not items:
+            return await interaction.response.send_message(
+                "Товаров нет. Добавьте через `/shop_add`.", ephemeral=True)
+        lines = []
+        for it in items:
+            emoji = (it.get("emoji") + " ") if it.get("emoji") else ""
+            stock = ("склад: " + str(it["stock"])) if it.get("stock") is not None else "склад: ∞"
+            role = f", роль <@&{it['role']}>" if it.get("role") else ""
+            lines.append(f"{emoji}**{it['name']}** — {it['price']}🪙, {stock}{role}")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @app_commands.command(name="shop_panel",
+                          description="Разместить магазин с товарами в канале")
+    @app_commands.describe(channel="Канал для магазина", title="Заголовок (необязательно)",
+                           description="Текст (необязательно)", color="Цвет HEX (необязательно)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def shop_panel(self, interaction, channel: discord.TextChannel,
+                         title: str = None, description: str = None, color: str = None):
+        cfg = get_guild(interaction.guild.id)
+        items = cfg["shop"].setdefault("items", [])
+        if not items:
+            return await interaction.response.send_message(
+                "Сначала добавьте товары: `/shop_add`.", ephemeral=True)
+        e = discord.Embed(title=title or "🛒 Магазин",
+                          description=description or
+                          "Выберите товар в меню ниже и подтвердите покупку.\n"
+                          f"Баланс: `/balance`. Заработать монеты — отчётом "
+                          f"(кнопка «Подать отчёт»).",
+                          color=parse_color(color) or discord.Color.gold())
+        view = ShopPanelView(with_items=items)
+        try:
+            await channel.send(embed=e, view=view)
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                f"Нет прав писать в {channel.mention}.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Магазин ({len(items)} товар(ов)) размещён в {channel.mention}.",
+            ephemeral=True)
+
+    @app_commands.command(name="shop_log", description="Задать канал логов покупок")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def shop_log(self, interaction, channel: discord.TextChannel):
+        cfg = get_guild(interaction.guild.id)
+        cfg["shop"]["log_channel"] = channel.id
+        save_guild(interaction.guild.id, cfg)
+        await interaction.response.send_message(
+            f"✅ Логи покупок: {channel.mention}.", ephemeral=True)
+
+    # ---------- Отчёты на монеты ----------
+
+    @app_commands.command(name="report_setup",
+                          description="Настроить систему отчётов на монеты")
+    @app_commands.describe(review_channel="Канал, куда падают отчёты на проверку",
+                           reward="Награда за одобренный отчёт (монет)",
+                           panel_channel="Канал с кнопкой подачи отчётов (необязательно)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def report_setup(self, interaction, review_channel: discord.TextChannel,
+                           reward: app_commands.Range[int, 1],
+                           panel_channel: discord.TextChannel = None):
+        cfg = get_guild(interaction.guild.id)
+        eco = cfg["economy"]
+        eco["review_channel"] = review_channel.id
+        eco["reward"] = reward
+        save_guild(interaction.guild.id, cfg)
+        msg = f"✅ Отчёты настроены:\n• Проверка: {review_channel.mention}\n• Награда: **{reward}**🪙"
+        if panel_channel:
+            e = discord.Embed(
+                title="📝 Отчёты за активность",
+                description=("Нажмите кнопку ниже и заполните форму. "
+                             f"Одобренный отчёт = **{reward}** монет."),
+                color=discord.Color.gold())
+            try:
+                await panel_channel.send(embed=e, view=ReportPanelView())
+            except discord.Forbidden:
+                return await interaction.response.send_message(
+                    msg + f"\n⚠️ Нет прав писать в {panel_channel.mention} — "
+                          f"панель не размещена.", ephemeral=True)
+            msg += f"\n• Кнопка подачи размещена в {panel_channel.mention}"
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    # ---------- Баланс ----------
+
+    @app_commands.command(name="balance", description="Показать баланс монет")
+    async def balance(self, interaction, участник: discord.Member = None):
+        member = участник or interaction.user
+        cfg = get_guild(interaction.guild.id)
+        bal = _eco_get_coins(cfg, member.id)
+        await interaction.response.send_message(
+            f"💰 Баланс {member.mention}: **{bal}**🪙", ephemeral=True)
+
+    @app_commands.command(name="top", description="Топ 10 богатейших участников")
+    async def top(self, interaction):
+        cfg = get_guild(interaction.guild.id)
+        coins = sorted(cfg.get("coins", {}).items(),
+                       key=lambda kv: kv[1], reverse=True)[:10]
+        lines = [f"**{i}.** <@{uid}> — {amount}🪙"
+                 for i, (uid, amount) in enumerate(coins, 1) if amount > 0]
+        await interaction.response.send_message(
+            "🏆 **Топ по монетам:**\n" + ("\n".join(lines) or "Пока пусто."),
+            ephemeral=True)
+
+    @app_commands.command(name="coins_add", description="Выдать монеты участнику")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def coins_add(self, interaction, участник: discord.Member,
+                        количество: app_commands.Range[int, 1]):
+        cfg = get_guild(interaction.guild.id)
+        new = _eco_change_coins(cfg, участник.id, количество)
+        save_guild(interaction.guild.id, cfg)
+        await interaction.response.send_message(
+            f"✅ {участник.mention}: +{количество}🪙 (итого **{new}**).", ephemeral=True)
+
+    @app_commands.command(name="coins_remove", description="Списать монеты у участника")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def coins_remove(self, interaction, участник: discord.Member,
+                           количество: app_commands.Range[int, 1]):
+        cfg = get_guild(interaction.guild.id)
+        new = _eco_change_coins(cfg, участник.id, -количество)
+        save_guild(interaction.guild.id, cfg)
+        await interaction.response.send_message(
+            f"✅ {участник.mention}: −{количество}🪙 (итого **{new}**).", ephemeral=True)
+
+
+# ==========================================================================
 #  COG: КОМАНДЫ НАСТРОЙКИ ЗАЩИТЫ
 # ==========================================================================
 
 TOGGLES = {"антиспам": "antispam", "антиинвайт": "antiinvite",
-           "антиссылки": "antilink",
+           "антиссылки": "antilink", "антиупоминания": "antimention",
            "антирейд": "antiraid", "антинюк": "antinuke",
            "усиленная защита": "strict_mode", "антибот": "antibot"}
 
 # читаемые названия для панели
 PROT_LABELS = {
     "antispam": "Анти-спам", "antiinvite": "Анти-инвайт", "antilink": "Антиссылки",
-    "antiraid": "Анти-рейд", "antinuke": "Анти-нюк", "strict_mode": "Усиленная защита",
-    "antibot": "Антибот",
+    "antimention": "Анти-упоминания", "antiraid": "Анти-рейд", "antinuke": "Анти-нюк",
+    "strict_mode": "Усиленная защита", "antibot": "Антибот",
 }
 
 
@@ -1067,7 +1620,14 @@ def panel_main_embed(guild_id):
                 value=f"Типы: {types}\nОткрыто: {len(t.get('open', {}))}", inline=False)
     log_ch = f"<#{cfg['log_channel']}>" if cfg["log_channel"] else "не задан"
     tlog = f"<#{t['log_channel']}>" if t.get("log_channel") else "не задан"
+    eco, sh = cfg["economy"], cfg["shop"]
+    review = f"<#{eco['review_channel']}>" if eco.get("review_channel") else "не задан"
+    shop_ch = f"<#{sh['log_channel']}>" if sh.get("log_channel") else "не задан"
     e.add_field(name="⚙️ Логи", value=f"Защита: {log_ch}\nТикеты: {tlog}", inline=False)
+    e.add_field(name="🪙 Экономика",
+                value=f"Товаров: {len(sh.get('items', []))}, логи: {shop_ch}\n"
+                      f"Отчёты: проверка {review}, награда {eco.get('reward', 0)}🪙",
+                inline=False)
     return e
 
 
@@ -1533,6 +2093,10 @@ class GuardBot(commands.Bot):
         self.add_view(TicketControlView())
         self.add_view(TicketSelectView())
         self.add_view(PersistentPanelView())
+        self.add_view(ReportPanelView())
+        self.add_view(ShopPanelView())          # колбэк селекта читает конфиг
+        # кнопки одобрения/отклонения отчётов работают после перезапуска
+        self.add_dynamic_items(ReviewButtons)
 
         # восстанавливаем меню ролей, чтобы селекты работали после перезапуска
         restored = 0
@@ -1549,6 +2113,7 @@ class GuardBot(commands.Bot):
         await self.add_cog(Protection(self))
         await self.add_cog(Tickets(self))
         await self.add_cog(Config(self))
+        await self.add_cog(Economy(self))
 
         # Мгновенная синхронизация на конкретный сервер, если задан GUILD_ID.
         # Глобальная синхронизация Discord обновляет команды у клиентов до часа,
