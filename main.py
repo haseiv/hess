@@ -690,7 +690,7 @@ class ReportModal(discord.ui.Modal):
         e.add_field(name="Награда", value=f"{eco.get('reward', 0)}🪙", inline=True)
         if self.proof.value:
             e.add_field(name="Доказательства", value=self.proof.value[:1024], inline=False)
-        view = ReviewButtons(interaction.user.id)
+        view = build_review_view(interaction.user.id)
         try:
             msg = await ch.send(embed=e, view=view)
         except discord.Forbidden:
@@ -703,81 +703,135 @@ class ReportModal(discord.ui.Modal):
         await interaction.followup.send(
             f"✅ Отчёт отправлен на проверку: {msg.jump_url}", ephemeral=True)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("Ошибка при отправке отчёта", exc_info=error)
+        msg = "Не удалось отправить отчёт. Сообщите администрации."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
-class ReviewButtons(discord.ui.DynamicItem,
-                    template=r"eco:(?P<action>approve|deny):(?P<user>\d+)"):
-    """Кнопки одобрения/отклонения отчёта. user_id зашит в custom_id,
-    поэтому кнопки работают даже после перезапуска бота."""
+
+async def _review_report(interaction: discord.Interaction, action, report_user):
+    """Общая логика одобрения/отклонения отчёта (вызывается из кнопок)."""
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "Только администраторы могут проверять отчёты.", ephemeral=True)
+
+    cfg = get_guild(interaction.guild.id)
+    eco = cfg["economy"]
+    rec = eco.setdefault("open", {}).get(str(interaction.message.id))
+    if rec and rec.get("status") != "pending":
+        return await interaction.response.send_message(
+            "Этот отчёт уже обработан.", ephemeral=True)
+
+    reward = eco.get("reward", 0)
+    user = interaction.guild.get_member(report_user)
+
+    if rec:
+        rec["status"] = ("approved" if action == "approve" else "denied")
+        rec["reviewer"] = interaction.user.id
+
+    if action == "approve":
+        balance = _eco_change_coins(cfg, report_user, reward)
+        save_guild(interaction.guild.id, cfg)
+        if user:
+            try:
+                await user.send(f"✅ Ваш отчёт на сервере **{interaction.guild.name}** "
+                                f"одобрен: +{reward}🪙. Баланс: **{balance}**🪙.")
+            except discord.HTTPException:
+                pass
+        e = interaction.message.embeds[0] if interaction.message.embeds else None
+        if e:
+            e.color = discord.Color.green()
+            e.add_field(name="Результат",
+                        value=f"Одобрено {interaction.user.mention}: +{reward}🪙",
+                        inline=False)
+    else:
+        if rec:
+            save_guild(interaction.guild.id, cfg)
+        e = interaction.message.embeds[0] if interaction.message.embeds else None
+        if e:
+            e.color = discord.Color.red()
+            e.add_field(name="Результат",
+                        value=f"Отклонено {interaction.user.mention}", inline=False)
+        if user:
+            try:
+                await user.send(f"❌ Ваш отчёт на сервере **{interaction.guild.name}** "
+                                f"отклонён. Уточните у администрации причину.")
+            except discord.HTTPException:
+                pass
+
+    # отключаем кнопки на сообщении
+    try:
+        new_view = discord.ui.View(timeout=None)
+        enabled_any = False
+        for r in interaction.message.components:
+            for c in r.children:
+                clone = None
+                if isinstance(c, discord.ui.Button):
+                    clone = discord.ui.Button(
+                        style=c.style, label=c.label, emoji=c.emoji,
+                        url=c.url, disabled=True)
+                elif isinstance(c, discord.ui.Select):
+                    clone = discord.ui.Select(
+                        placeholder=c.placeholder, options=c.options,
+                        disabled=True)
+                if clone:
+                    new_view.add_item(clone)
+                    enabled_any = True
+        view_to_send = new_view if enabled_any else None
+    except Exception:
+        view_to_send = None
+
+    await interaction.response.edit_message(embed=e, view=view_to_send)
+
+
+class ApproveReport(discord.ui.DynamicItem,
+                    template=r"eco:approve:(?P<user>\d+)"):
+    """Кнопка «Одобрить»: user_id зашит в custom_id, поэтому работает
+    даже после перезапуска бота."""
 
     def __init__(self, user_id):
         self.report_user = user_id
-        approve = discord.ui.Button(label="Одобрить", style=discord.ButtonStyle.success,
-                                    emoji="✅",
-                                    custom_id=f"eco:approve:{user_id}")
-        deny = discord.ui.Button(label="Отклонить", style=discord.ButtonStyle.danger,
-                                 emoji="❌",
-                                 custom_id=f"eco:deny:{user_id}")
-        super().__init__(approve, deny)
+        super().__init__(discord.ui.Button(
+            label="Одобрить", style=discord.ButtonStyle.success, emoji="✅",
+            custom_id=f"eco:approve:{user_id}"))
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match):
         return cls(int(match["user"]))
 
     async def callback(self, interaction: discord.Interaction):
-        action = self.custom_id.split(":")[1]
-        if not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message(
-                "Только администраторы могут проверять отчёты.", ephemeral=True)
+        await _review_report(interaction, "approve", self.report_user)
 
-        cfg = get_guild(interaction.guild.id)
-        eco = cfg["economy"]
-        rec = eco.setdefault("open", {}).get(str(interaction.message.id))
-        if rec and rec.get("status") != "pending":
-            return await interaction.response.send_message(
-                "Этот отчёт уже обработан.", ephemeral=True)
 
-        reward = eco.get("reward", 0)
-        user = interaction.guild.get_member(self.report_user)
-        mention = user.mention if user else f"<@{self.report_user}>"
+class DenyReport(discord.ui.DynamicItem,
+                 template=r"eco:deny:(?P<user>\d+)"):
 
-        if rec:
-            rec["status"] = "approved" if action == "approve" else "denied"
-            rec["reviewer"] = interaction.user.id
+    def __init__(self, user_id):
+        self.report_user = user_id
+        super().__init__(discord.ui.Button(
+            label="Отклонить", style=discord.ButtonStyle.danger, emoji="❌",
+            custom_id=f"eco:deny:{user_id}"))
 
-        if action == "approve":
-            balance = _eco_change_coins(cfg, self.report_user, reward)
-            save_guild(interaction.guild.id, cfg)
-            if user:
-                try:
-                    await user.send(f"✅ Ваш отчёт на сервере **{interaction.guild.name}** "
-                                    f"одобрен: +{reward}🪙. Баланс: **{balance}**🪙.")
-                except discord.HTTPException:
-                    pass
-            e = interaction.message.embeds[0] if interaction.message.embeds else None
-            if e:
-                e.color = discord.Color.green()
-                e.add_field(name="Результат", value=f"Одобрено {interaction.user.mention}: "
-                                                    f"+{reward}🪙", inline=False)
-            for c in self.children:
-                c.disabled = True
-            await interaction.response.edit_message(embed=e, view=self)
-        else:
-            if rec:
-                save_guild(interaction.guild.id, cfg)
-            e = interaction.message.embeds[0] if interaction.message.embeds else None
-            if e:
-                e.color = discord.Color.red()
-                e.add_field(name="Результат",
-                            value=f"Отклонено {interaction.user.mention}", inline=False)
-            for c in self.children:
-                c.disabled = True
-            await interaction.response.edit_message(embed=e, view=self)
-            if user:
-                try:
-                    await user.send(f"❌ Ваш отчёт на сервере **{interaction.guild.name}** "
-                                    f"отклонён. Уточните у администрации причину.")
-                except discord.HTTPException:
-                    pass
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["user"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await _review_report(interaction, "deny", self.report_user)
+
+
+def build_review_view(user_id):
+    """Ряд кнопок ✅/❌ для сообщения с отчётом."""
+    v = discord.ui.View(timeout=None)
+    v.add_item(ApproveReport(user_id))
+    v.add_item(DenyReport(user_id))
+    return v
 
 
 # ==========================================================================
@@ -2095,7 +2149,7 @@ class GuardBot(commands.Bot):
         self.add_view(ReportPanelView())
         self.add_view(ShopPanelView())          # колбэк селекта читает конфиг
         # кнопки одобрения/отклонения отчётов работают после перезапуска
-        self.add_dynamic_items(ReviewButtons)
+        self.add_dynamic_items(ApproveReport, DenyReport)
 
         # восстанавливаем меню ролей, чтобы селекты работали после перезапуска
         restored = 0
