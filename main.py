@@ -851,6 +851,8 @@ class Protection(commands.Cog):
         self._msg_times = defaultdict(lambda: deque(maxlen=25))
         self._joins = defaultdict(lambda: deque(maxlen=50))
         self._nuke_actions = defaultdict(lambda: deque(maxlen=50))
+        self._antilink_locks: dict[int, asyncio.Lock] = {}   # guild_id+user_id -> Lock
+        self._antilink_handled: set[int] = set()             # (guild_id, user_id) — уже обрабатываем
 
     async def _log(self, guild, embed):
         ch_id = get_guild(guild.id).get("log_channel")
@@ -941,39 +943,69 @@ class Protection(commands.Cog):
                 return
 
         if prot.get("antilink") and LINK_RE.search(message.content):
+            # Сразу удаляем сообщение — без ожидания
             try:
                 await message.delete()
             except discord.HTTPException:
                 pass
-            secs = prot.get("antilink_timeout", 3600)
-            muted = False
-            try:
-                await member.timeout(timedelta(seconds=secs),
-                                     reason="Антиссылки: отправка ссылки")
-                muted = True
-            except (discord.Forbidden, discord.HTTPException):
-                pass
-            # предупреждение ЛИЧНО нарушителю (в ЛС), без спама в канал
-            hours = max(1, round(secs / 3600))
-            warn = (f"На сервере **{message.guild.name}** запрещена отправка ссылок. "
-                    f"Ваше сообщение удалено"
-                    + (f", выдан тайм-аут на {hours} ч." if muted else "."))
-            try:
-                await member.send(warn)
-            except discord.HTTPException:
-                # если ЛС закрыты — короткое авто-удаляемое сообщение в канале
+
+            key = (message.guild.id, member.id)
+
+            # Если уже выдаём тайм-аут этому пользователю — просто удалили и выходим
+            if key in self._antilink_handled:
+                return
+
+            # Берём/создаём лок для этого пользователя
+            if key not in self._antilink_locks:
+                self._antilink_locks[key] = asyncio.Lock()
+            lock = self._antilink_locks[key]
+
+            if lock.locked():
+                # Другой обработчик уже занимается этим пользователем
+                return
+
+            async with lock:
+                # Двойная проверка после получения лока
+                if key in self._antilink_handled:
+                    return
+                self._antilink_handled.add(key)
                 try:
-                    await message.channel.send(f"{member.mention}, ссылки запрещены.",
-                                               delete_after=7)
-                except discord.HTTPException:
-                    pass
-            await self._log(message.guild, discord.Embed(
-                title="🔗 Антиссылки",
-                description=f"**Автор:** {member.mention}\n"
-                            f"**Канал:** {message.channel.mention}\n"
-                            f"{'Выдан тайм-аут на ' + str(hours) + ' ч.' if muted else 'Тайм-аут не выдан (нет прав).'}",
-                color=discord.Color.orange()))
+                    secs = prot.get("antilink_timeout", 3600)
+                    muted = False
+                    try:
+                        await member.timeout(timedelta(seconds=secs),
+                                             reason="Антиссылки: отправка ссылки")
+                        muted = True
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+
+                    hours = max(1, round(secs / 3600))
+                    warn = (f"На сервере **{message.guild.name}** запрещена отправка ссылок. "
+                            f"Ваше сообщение удалено"
+                            + (f", выдан тайм-аут на {hours} ч." if muted else "."))
+                    try:
+                        await member.send(warn)
+                    except discord.HTTPException:
+                        try:
+                            await message.channel.send(f"{member.mention}, ссылки запрещены.",
+                                                       delete_after=7)
+                        except discord.HTTPException:
+                            pass
+
+                    await self._log(message.guild, discord.Embed(
+                        title="🔗 Антиссылки",
+                        description=f"**Автор:** {member.mention}\n"
+                                    f"**Канал:** {message.channel.mention}\n"
+                                    f"{'Выдан тайм-аут на ' + str(hours) + ' ч.' if muted else 'Тайм-аут не выдан (нет прав).'}",
+                        color=discord.Color.orange()))
+                finally:
+                    # Снимаем флаг после небольшой задержки,
+                    # чтобы спам-сообщения успели удалиться
+                    await asyncio.sleep(2)
+                    self._antilink_handled.discard(key)
             return
+
+
 
         if prot["antispam"]:
             key = (message.guild.id, member.id)
