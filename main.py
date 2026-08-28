@@ -1246,7 +1246,7 @@ class CloseButton(discord.ui.Button):
 def panel_main_embed(guild_id):
     """Статус-эмбед главного меню (общий для постоянной и приватной панели)."""
     cfg = get_guild(guild_id)
-    p, t = cfg["protection"], cfg["tickets"]
+    p = cfg["protection"]
     yn = lambda v: "✅" if v else "❌"
     prot = " ".join(f"{yn(p.get(k))}{PROT_LABELS[k]}" for k in PROT_LABELS)
     types = ", ".join(x["label"] for x in t.get("types", [])) or "нет"
@@ -1332,10 +1332,6 @@ class EphemeralMainView(discord.ui.View):
         view = ProtectionPanelView(self.guild_id)
         await interaction.response.edit_message(embed=view.embed(), view=view)
 
-    @discord.ui.button(label="🎫 Тикеты", style=discord.ButtonStyle.primary)
-    async def tickets(self, interaction, button):
-        view = TicketsPanelView(self.guild_id)
-        await interaction.response.edit_message(embed=view.embed(), view=view)
 
     @discord.ui.button(label="⚙️ Логи", style=discord.ButtonStyle.primary)
     async def logs(self, interaction, button):
@@ -1391,13 +1387,11 @@ class LogsPanelView(discord.ui.View):
         super().__init__(timeout=300)
         self.guild_id = guild_id
         self.add_item(LogSelect("protection", "Канал логов защиты"))
-        self.add_item(LogSelect("tickets", "Канал логов тикетов"))
         self.add_item(BackButton())
 
     def embed(self):
         cfg = get_guild(self.guild_id)
         log_ch = f"<#{cfg['log_channel']}>" if cfg["log_channel"] else "не задан"
-        tlog = f"<#{cfg['tickets']['log_channel']}>" if cfg["tickets"].get("log_channel") else "не задан"
         return discord.Embed(
             title="⚙️ Каналы логов",
             description=f"**Логи защиты:** {log_ch}\n**Логи тикетов:** {tlog}\n\n"
@@ -1528,7 +1522,7 @@ class Config(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def settings(self, interaction):
         cfg = get_guild(interaction.guild.id)
-        p, t = cfg["protection"], cfg["tickets"]
+        p = cfg["protection"]
         yn = lambda v: "✅" if v else "❌"
         log_ch = f"<#{cfg['log_channel']}>" if cfg["log_channel"] else "не задан"
         wl = ", ".join(f"<@{u}>" for u in p["whitelist"]) or "пусто"
@@ -1548,7 +1542,6 @@ class Config(commands.Cog):
         role = f"<@&{t['support_role']}>" if t["support_role"] else "не задана"
         tlog = f"<#{t['log_channel']}>" if t["log_channel"] else "не задан"
         types = t.get("types", [])
-        types_line = (", ".join(x["label"] for x in types)) if types else "нет (добавьте /ticket_type_add)"
         embed.add_field(name="🎫 Тикеты", value=(
             f"Логи: {tlog}\nТипы: {types_line}\n"
             f"Открыто сейчас: {len(t['open'])}\n"
