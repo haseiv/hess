@@ -34,6 +34,12 @@ try:
 except ImportError:
     pass  # dotenv не обязателен, если токен задан через переменную окружения
 
+try:
+    from welcome import create_welcome_card_async, generate_welcome_card
+except ImportError:
+    create_welcome_card_async = None
+    generate_welcome_card = None
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -99,6 +105,11 @@ _DEFAULT_GUILD = {
         "counter": 0,
         "open": {},
         "types": [],   # [{"label","category","roles":[...],"emoji","description"}]
+    },
+    "welcome": {
+        "enabled": True,            # включены ли приветствия
+        "channel_id": None,         # id канала для приветствий
+        "message": "Добро пожаловать на сервер **{server}**, {mention}! 🌴",
     },
 }
 
@@ -1267,6 +1278,12 @@ def panel_main_embed(guild_id):
                 value=f"Товаров: {len(sh.get('items', []))}, логи: {shop_ch}\n"
                       f"Отчёты: проверка {review}, награда {eco.get('reward', 0)}🪙",
                 inline=False)
+    wel = cfg.get("welcome", {})
+    wel_ch = f"<#{wel['channel_id']}>" if wel.get("channel_id") else "не задан"
+    wel_status = "✅ вкл" if wel.get("enabled", True) and wel.get("channel_id") else ("⚠️ канал не задан" if wel.get("enabled", True) else "❌ выкл")
+    e.add_field(name="🌴 Приветствия (Miami DM)",
+                value=f"Статус: {wel_status} • Канал: {wel_ch}",
+                inline=False)
     return e
 
 
@@ -1613,6 +1630,121 @@ class Config(commands.Cog):
 
 
 # ==========================================================================
+#  ПРИВЕТСТВИЯ (MIAMI DM WELCOME BANNER)
+# ==========================================================================
+
+class Welcome(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        if member.bot:
+            return  # Ботов не приветствуем
+
+        cfg = get_guild(member.guild.id)
+        wel = cfg.get("welcome", {})
+        if not wel.get("enabled", True):
+            return
+
+        ch_id = wel.get("channel_id")
+        if not ch_id:
+            return
+
+        channel = member.guild.get_channel(ch_id)
+        if not channel:
+            return
+
+        try:
+            file = None
+            if create_welcome_card_async:
+                buf = await create_welcome_card_async(member)
+                file = discord.File(fp=buf, filename="welcome.jpg")
+
+            msg_template = wel.get("message") or "Добро пожаловать на сервер **{server}**, {mention}! 🌴"
+            content = msg_template.format(
+                mention=member.mention,
+                user=member.display_name,
+                server=member.guild.name,
+                count=member.guild.member_count,
+            )
+
+            if file:
+                await channel.send(content=content, file=file)
+            else:
+                await channel.send(content=content)
+        except discord.Forbidden:
+            log.warning("Нет прав для отправки приветствия в канал %s (сервер %s)", ch_id, member.guild.id)
+        except Exception as e:
+            log.exception("Ошибка при отправке приветствия для %s: %s", member, e)
+
+    @app_commands.command(name="welcome_setup",
+                          description="Настроить приветствие с баннером Miami DM")
+    @app_commands.describe(
+        channel="Канал, куда бот будет присылать приветственный баннер",
+        message="Текст сообщения (переменные: {mention}, {user}, {server}, {count})")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def welcome_setup(self, interaction: discord.Interaction,
+                            channel: discord.TextChannel,
+                            message: str = None):
+        cfg = get_guild(interaction.guild.id)
+        wel = cfg.setdefault("welcome", {})
+        wel["channel_id"] = channel.id
+        wel["enabled"] = True
+        if message:
+            wel["message"] = message
+        save_guild(interaction.guild.id, cfg)
+
+        await interaction.response.send_message(
+            f"✅ Приветствия включены!\n"
+            f"• Канал: {channel.mention}\n"
+            f"• Сообщение: `{wel.get('message')}`\n"
+            f"Используйте `/welcome_test`, чтобы посмотреть, как выглядит баннер.",
+            ephemeral=True
+        )
+
+    @app_commands.command(name="welcome_test",
+                          description="Протестировать и посмотреть приветственный баннер Miami DM")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def welcome_test(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if not create_welcome_card_async:
+            return await interaction.followup.send("⚠️ Модуль генерации баннера (Pillow) недоступен.", ephemeral=True)
+
+        try:
+            buf = await create_welcome_card_async(interaction.user)
+            file = discord.File(fp=buf, filename="welcome_test.jpg")
+            cfg = get_guild(interaction.guild.id)
+            wel = cfg.get("welcome", {})
+            msg_template = wel.get("message") or "Добро пожаловать на сервер **{server}**, {mention}! 🌴"
+            content = msg_template.format(
+                mention=interaction.user.mention,
+                user=interaction.user.display_name,
+                server=interaction.guild.name,
+                count=interaction.guild.member_count,
+            )
+            await interaction.followup.send(
+                content=f"🎉 **Предпросмотр приветственного баннера:**\n{content}",
+                file=file,
+                ephemeral=True
+            )
+        except Exception as e:
+            log.exception("Ошибка в welcome_test: %s", e)
+            await interaction.followup.send(f"❌ Ошибка генерации: {e}", ephemeral=True)
+
+    @app_commands.command(name="welcome_toggle",
+                          description="Включить или отключить приветствия")
+    @app_commands.describe(включить="True — включить, False — выключить")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def welcome_toggle(self, interaction: discord.Interaction, включить: bool):
+        cfg = get_guild(interaction.guild.id)
+        cfg.setdefault("welcome", {})["enabled"] = включить
+        save_guild(interaction.guild.id, cfg)
+        status = "включены" if включить else "отключены"
+        await interaction.response.send_message(f"✅ Приветствия {status}.", ephemeral=True)
+
+
+# ==========================================================================
 #  ЗАПУСК
 # ==========================================================================
 
@@ -1648,6 +1780,7 @@ class GuardBot(commands.Bot):
         await self.add_cog(Protection(self))
         await self.add_cog(Config(self))
         await self.add_cog(Economy(self))
+        await self.add_cog(Welcome(self))
 
         # Мгновенная синхронизация на конкретный сервер, если задан GUILD_ID.
         # Глобальная синхронизация Discord обновляет команды у клиентов до часа,

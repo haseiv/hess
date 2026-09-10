@@ -44,6 +44,11 @@ _DEFAULT_GUILD = {
         "counter": 0,               # счётчик номеров тикетов
         "open": {},                 # {channel_id: {"user": id, "claimed_by": id|null}}
     },
+    "welcome": {
+        "enabled": True,            # включены ли приветствия
+        "channel_id": None,         # id канала для приветствий
+        "message": "Добро пожаловать на сервер **{server}**, {mention}! 🌴",
+    },
 }
 
 
